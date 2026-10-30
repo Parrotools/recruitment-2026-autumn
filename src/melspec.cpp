@@ -406,13 +406,18 @@ void run_workers(std::size_t workers, Body&& body) {
 #ifndef MELSPEC_FFT_FLOAT
 #define MELSPEC_FFT_FLOAT 0
 #endif
+#ifndef MELSPEC_FREQ_WINDOW
+#define MELSPEC_FREQ_WINDOW 1
+#endif
 
 template <typename Real>
 class DftiPlan {
    public:
     // `batch` real transforms of length n, stored back to back with a stride
-    // of n + 2 doubles so each fits its n/2+1 complex outputs in place.
-    DftiPlan(std::size_t n, std::size_t batch) {
+    // of n + 2 doubles so each fits its n/2+1 complex outputs in place; or,
+    // with out_of_place, one transform from caller input to a separate
+    // n/2+1 complex output.
+    DftiPlan(std::size_t n, std::size_t batch, bool out_of_place = false) {
         // DftiCreateDescriptor is a macro, so the precision is computed
         // first: a template argument list would split its arguments.
         const DFTI_CONFIG_VALUE precision =
@@ -423,6 +428,8 @@ class DftiPlan {
             status = DftiSetValue(handle_, DFTI_CONJUGATE_EVEN_STORAGE,
                                   DFTI_COMPLEX_COMPLEX);
         if (status == 0) status = DftiSetValue(handle_, DFTI_THREAD_LIMIT, 1);
+        if (status == 0 && out_of_place)
+            status = DftiSetValue(handle_, DFTI_PLACEMENT, DFTI_NOT_INPLACE);
         if (status == 0 && batch > 1) {
             status = DftiSetValue(handle_, DFTI_NUMBER_OF_TRANSFORMS,
                                   static_cast<MKL_LONG>(batch));
@@ -449,6 +456,12 @@ class DftiPlan {
         if (DftiComputeForward(handle_, data) != 0)
             throw std::runtime_error("MKL DFTI forward transform failed");
     }
+    // Out-of-place plans only; MKL leaves the input of such a transform
+    // unmodified, but its C interface takes a non-const pointer.
+    void forward(const Real* input, Real* output) const {
+        if (DftiComputeForward(handle_, const_cast<Real*>(input), output) != 0)
+            throw std::runtime_error("MKL DFTI forward transform failed");
+    }
 
    private:
     DFTI_DESCRIPTOR_HANDLE handle_ = nullptr;
@@ -461,6 +474,48 @@ constexpr std::size_t kFftBatch = MELSPEC_MKL_BATCH;
 static_assert(kTileFrames % kFftBatch == 0, "batch must divide the tile");
 // Tiles handed out per scheduling step.
 constexpr std::size_t kTilesPerClaim = 2;
+
+// The periodic Hann window is w[n] = 1/2 - (e^{2 pi i n/N} + e^{-2 pi i
+// n/N})/4, so the DFT of a windowed frame is exactly
+//     Y[k] = X[k]/2 - (X[k-1] + X[k+1])/4
+// with X the DFT of the unwindowed frame. Transforming straight from the
+// input samples (out of place) and applying the window here, only on the
+// bins the Mel bands read, removes the per-frame windowed copy.
+// The input samples are double, so only a double FFT can read them directly.
+template <typename Real>
+constexpr bool kFreqWindow =
+    MELSPEC_FREQ_WINDOW && kFftBatch == 1 && std::is_same<Real, double>::value;
+
+// Writes |Y[k]|^2 for the active bins of the frame at `frame` into power.
+template <typename Real, typename Lap>
+void frequency_window_power(const DftiPlan<Real>& plan, const double* frame,
+                            std::vector<Real>& spectrum, std::size_t n_bins,
+                            std::size_t active_first, std::vector<Real>& power,
+                            Lap& lap) {
+    static_assert(std::is_same<Real, double>::value,
+                  "the input samples are double");
+    lap(0);
+    Real* x = spectrum.data() + 2;  // x[2k], x[2k+1]: Re, Im of X[k]
+    plan.forward(frame, x);
+    lap(1);
+    // X is conjugate-even for real input: X[-1] = conj(X[1]) and
+    // X[n/2+1] = conj(X[n/2-1]).
+    const std::size_t half = n_bins - 1;
+    x[-2] = x[2];
+    x[-1] = -x[3];
+    x[2 * (half + 1)] = x[2 * (half - 1)];
+    x[2 * (half + 1) + 1] = -x[2 * (half - 1) + 1];
+    const Real* bin = x + 2 * active_first;
+    const std::size_t count = power.size();
+    for (std::size_t k = 0; k < count; ++k) {
+        const Real re = Real(0.5) * bin[2 * k] -
+                        Real(0.25) * (bin[2 * k - 2] + bin[2 * k + 2]);
+        const Real im = Real(0.5) * bin[2 * k + 1] -
+                        Real(0.25) * (bin[2 * k - 1] + bin[2 * k + 3]);
+        power[k] = re * re + im * im;
+    }
+    lap(2);
+}
 
 // Real is the FFT working precision; the Mel accumulation is always double.
 //
@@ -554,9 +609,12 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         };
 
         std::vector<Real> window_real(window.begin(), window.end());
-        const DftiPlan<Real> plan(fft_size, kFftBatch);
+        const DftiPlan<Real> plan(fft_size, kFftBatch, kFreqWindow<Real>);
         const Clock::time_point planned = Clock::now();
-        std::vector<Real> buffer(stride * kFftBatch);
+        std::vector<Real> buffer(kFreqWindow<Real> ? 0 : stride * kFftBatch);
+        // Unwindowed spectrum X[-1..n/2+1] for the frequency-domain window;
+        // bin k is at spectrum[2 * (k + 1)].
+        std::vector<Real> spectrum(kFreqWindow<Real> ? 2 * (n_bins + 2) : 0);
         std::vector<Real> power(active_bins);
         std::vector<double> tile_out(mel_count * kTileFrames);
 
@@ -567,6 +625,22 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
             const Clock::time_point now = Clock::now();
             stage[index] += std::chrono::duration<double>(now - mark).count();
             mark = now;
+        };
+        // Mel bands of one frame's power (bins from active_first) into
+        // column f of the tile.
+        const auto mel_frame = [&](const std::vector<Real>& frame_power,
+                                   std::size_t f) {
+            for (std::size_t m = 0; m < mel_count; ++m) {
+                const MelBand& band = mel.bands[m];
+                const double* weights = mel.values.data() + band.offset;
+                const Real* p =
+                    frame_power.data() + (band.first - active_first);
+                const std::size_t length = band.end - band.first;
+                double sum = 0.0;
+                for (std::size_t k = 0; k < length; ++k)
+                    sum += p[k] * weights[k];
+                tile_out[m * kTileFrames + f] = sum;
+            }
         };
 
         for (;;) {
@@ -581,46 +655,45 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 const std::size_t frame0 = tile * kTileFrames;
                 const std::size_t count =
                     std::min(kTileFrames, n_frames - frame0);
-                for (std::size_t batch0 = 0; batch0 < count;
-                     batch0 += kFftBatch) {
-                    // Frames past the end of a partial batch repeat the last
-                    // valid frame; their results are never stored.
-                    for (std::size_t b = 0; b < kFftBatch; ++b) {
-                        const std::size_t f = std::min(batch0 + b, count - 1);
-                        const double* src = samples + (frame0 + f) * hop;
-                        Real* data = buffer.data() + b * stride;
-                        for (std::size_t i = 0; i < fft_size; ++i)
-                            data[i] =
-                                static_cast<Real>(src[i]) * window_real[i];
-                    }
-                    lap(0);
-                    plan.forward(buffer.data());
-                    lap(1);
-                    const std::size_t batch_count =
-                        std::min(kFftBatch, count - batch0);
-                    for (std::size_t b = 0; b < batch_count; ++b) {
-                        const Real* bin =
-                            buffer.data() + b * stride + 2 * active_first;
-                        for (std::size_t k = 0; k < active_bins; ++k) {
-                            const Real re = bin[2 * k];
-                            const Real im = bin[2 * k + 1];
-                            power[k] = re * re + im * im;
-                        }
-                        lap(2);
-                        const std::size_t f = batch0 + b;
-                        for (std::size_t m = 0; m < mel_count; ++m) {
-                            const MelBand& band = mel.bands[m];
-                            const double* weights =
-                                mel.values.data() + band.offset;
-                            const Real* p =
-                                power.data() + (band.first - active_first);
-                            const std::size_t length = band.end - band.first;
-                            double sum = 0.0;
-                            for (std::size_t k = 0; k < length; ++k)
-                                sum += p[k] * weights[k];
-                            tile_out[m * kTileFrames + f] = sum;
-                        }
+                if constexpr (kFreqWindow<Real>) {
+                    for (std::size_t f = 0; f < count; ++f) {
+                        frequency_window_power(
+                            plan, samples + (frame0 + f) * hop, spectrum,
+                            n_bins, active_first, power, lap);
+                        mel_frame(power, f);
                         lap(3);
+                    }
+                } else {
+                    for (std::size_t batch0 = 0; batch0 < count;
+                         batch0 += kFftBatch) {
+                        // Frames past the end of a partial batch repeat the
+                        // last valid frame; their results are never stored.
+                        for (std::size_t b = 0; b < kFftBatch; ++b) {
+                            const std::size_t f =
+                                std::min(batch0 + b, count - 1);
+                            const double* src = samples + (frame0 + f) * hop;
+                            Real* data = buffer.data() + b * stride;
+                            for (std::size_t i = 0; i < fft_size; ++i)
+                                data[i] =
+                                    static_cast<Real>(src[i]) * window_real[i];
+                        }
+                        lap(0);
+                        plan.forward(buffer.data());
+                        lap(1);
+                        const std::size_t batch_count =
+                            std::min(kFftBatch, count - batch0);
+                        for (std::size_t b = 0; b < batch_count; ++b) {
+                            const Real* bin =
+                                buffer.data() + b * stride + 2 * active_first;
+                            for (std::size_t k = 0; k < active_bins; ++k) {
+                                const Real re = bin[2 * k];
+                                const Real im = bin[2 * k + 1];
+                                power[k] = re * re + im * im;
+                            }
+                            lap(2);
+                            mel_frame(power, batch0 + b);
+                            lap(3);
+                        }
                     }
                 }
                 if (ready) {
