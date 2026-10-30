@@ -472,6 +472,9 @@ class DftiPlan {
 constexpr std::size_t kTileFrames = 16;
 constexpr std::size_t kFftBatch = MELSPEC_MKL_BATCH;
 static_assert(kTileFrames % kFftBatch == 0, "batch must divide the tile");
+// Frames whose Mel sums are accumulated together (independent FMA chains).
+constexpr std::size_t kMelGroup = 4;
+static_assert(kTileFrames % kMelGroup == 0, "groups must tile a tile");
 // Tiles handed out per scheduling step.
 constexpr std::size_t kTilesPerClaim = 2;
 
@@ -490,8 +493,8 @@ constexpr bool kFreqWindow =
 template <typename Real, typename Lap>
 void frequency_window_power(const DftiPlan<Real>& plan, const double* frame,
                             std::vector<Real>& spectrum, std::size_t n_bins,
-                            std::size_t active_first, std::vector<Real>& power,
-                            Lap& lap) {
+                            std::size_t active_first, Real* power,
+                            std::size_t count, Lap& lap) {
     static_assert(std::is_same<Real, double>::value,
                   "the input samples are double");
     lap(0);
@@ -506,7 +509,6 @@ void frequency_window_power(const DftiPlan<Real>& plan, const double* frame,
     x[2 * (half + 1)] = x[2 * (half - 1)];
     x[2 * (half + 1) + 1] = -x[2 * (half - 1) + 1];
     const Real* bin = x + 2 * active_first;
-    const std::size_t count = power.size();
     for (std::size_t k = 0; k < count; ++k) {
         const Real re = Real(0.5) * bin[2 * k] -
                         Real(0.25) * (bin[2 * k - 2] + bin[2 * k + 2]);
@@ -625,6 +627,9 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         // bin k is at spectrum[2 * (k + 1)].
         std::vector<Real> spectrum(kFreqWindow<Real> ? 2 * (n_bins + 2) : 0);
         std::vector<Real> power(active_bins);
+        // Power rows of a group of frames for the frequency-window path.
+        std::vector<Real> power_group(
+            kFreqWindow<Real> ? kMelGroup * active_bins : 0);
         std::vector<double> tile_out(mel_count * kTileFrames);
 
         double stage[4] = {0, 0, 0, 0};
@@ -652,6 +657,39 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
             }
         };
 
+        // Mel bands of `group` (1..kMelGroup) frames whose power rows start
+        // at rows, into tile columns f0... Every frame keeps its own
+        // ascending-bin sum, so results equal mel_frame's bit for bit; the
+        // independent sums only let the FMA chains overlap instead of each
+        // waiting on the previous add.
+        const auto mel_group = [&](const Real* rows, std::size_t f0,
+                                   std::size_t group) {
+            const Real* row[kMelGroup];
+            for (std::size_t g = 0; g < kMelGroup; ++g)
+                row[g] = rows + std::min(g, group - 1) * active_bins;
+            for (std::size_t m = 0; m < mel_count; ++m) {
+                const MelBand& band = mel.bands[m];
+                const double* weights = mel.values.data() + band.offset;
+                const std::size_t offset = band.first - active_first;
+                const Real* p0 = row[0] + offset;
+                const Real* p1 = row[1] + offset;
+                const Real* p2 = row[2] + offset;
+                const Real* p3 = row[3] + offset;
+                const std::size_t length = band.end - band.first;
+                double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+                for (std::size_t k = 0; k < length; ++k) {
+                    const double w = weights[k];
+                    s0 += p0[k] * w;
+                    s1 += p1[k] * w;
+                    s2 += p2[k] * w;
+                    s3 += p3[k] * w;
+                }
+                double* out = tile_out.data() + m * kTileFrames + f0;
+                const double sums[kMelGroup] = {s0, s1, s2, s3};
+                for (std::size_t g = 0; g < group; ++g) out[g] = sums[g];
+            }
+        };
+
         for (;;) {
             if (!ready && !become_ready(false)) return;
             const std::size_t claim =
@@ -665,11 +703,16 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 const std::size_t count =
                     std::min(kTileFrames, n_frames - frame0);
                 if constexpr (kFreqWindow<Real>) {
-                    for (std::size_t f = 0; f < count; ++f) {
-                        frequency_window_power(
-                            plan, samples + (frame0 + f) * hop, spectrum,
-                            n_bins, active_first, power, lap);
-                        mel_frame(power, f);
+                    for (std::size_t f0 = 0; f0 < count; f0 += kMelGroup) {
+                        const std::size_t group =
+                            std::min(kMelGroup, count - f0);
+                        for (std::size_t g = 0; g < group; ++g)
+                            frequency_window_power(
+                                plan, samples + (frame0 + f0 + g) * hop,
+                                spectrum, n_bins, active_first,
+                                power_group.data() + g * active_bins,
+                                active_bins, lap);
+                        mel_group(power_group.data(), f0, group);
                         lap(3);
                     }
                 } else {
