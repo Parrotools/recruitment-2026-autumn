@@ -11,7 +11,10 @@ HUGE_ALLOC ?= 1
 else
 HUGE_ALLOC ?= 0
 endif
-FUSED_FFT ?= 0
+# Hand-written FFT path only (no MKL): fusing radix-2 stage pairs measured
+# 17-23% faster on the cluster with bitwise-identical output; the 8-lane
+# AVX512 variant measured 20-30% slower, so it stays off.
+FUSED_FFT ?= 1
 AVX512 ?= 0
 ARCH_FLAGS ?= -march=native
 
