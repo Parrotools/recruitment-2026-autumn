@@ -66,7 +66,7 @@ LDLIBS += -pthread
 
 MELSPEC_DEFINES += -DMELSPEC_MKL=$(MKL)
 ifeq ($(MKL),1)
-CPPFLAGS += -I$(MKLROOT)/include
+MELSPEC_DEFINES += -I$(MKLROOT)/include
 # Static sequential MKL: no runtime library path needed and no extra MKL
 # threads; parallelism comes from our own frame partitioning.
 LDLIBS += -Wl,--start-group $(MKLROOT)/lib/libmkl_intel_lp64.a \

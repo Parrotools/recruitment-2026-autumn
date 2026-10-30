@@ -25,6 +25,10 @@
 
 namespace {
 
+#ifndef MELSPEC_TOUCH_THREADS
+#define MELSPEC_TOUCH_THREADS 16
+#endif
+
 constexpr std::size_t kBigAllocationThreshold = std::size_t{1} << 20;
 constexpr std::size_t kHugePageAlignment = std::size_t{2} << 20;
 constexpr std::uint64_t kSmallAllocationTag = 0x6d656c736d616c6cull;
@@ -140,7 +144,8 @@ void touch_mapping(unsigned char* base, std::size_t usable_size) noexcept {
     const std::size_t page_count = 1 + (usable_size - 1) / page_size;
     const std::size_t workers = std::max<std::size_t>(
         1, std::min<std::size_t>({allocator_usable_cpus(),
-                                  allocator_thread_limit(), page_count, 16}));
+                                  allocator_thread_limit(), page_count,
+                                  std::size_t{MELSPEC_TOUCH_THREADS}}));
     if (workers == 1) {
         touch_pages(base, page_size, 0, page_count);
         return;

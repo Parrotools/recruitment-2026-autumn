@@ -11,6 +11,7 @@
 #include <limits>
 #include <stdexcept>
 #include <thread>
+#include <type_traits>
 #include <utility>
 #include <vector>
 
@@ -391,13 +392,21 @@ void run_workers(std::size_t workers, Body&& body) {
 #ifndef MELSPEC_MKL_BATCH
 #define MELSPEC_MKL_BATCH 1
 #endif
+#ifndef MELSPEC_FFT_FLOAT
+#define MELSPEC_FFT_FLOAT 0
+#endif
 
+template <typename Real>
 class DftiPlan {
    public:
     // `batch` real transforms of length n, stored back to back with a stride
     // of n + 2 doubles so each fits its n/2+1 complex outputs in place.
     DftiPlan(std::size_t n, std::size_t batch) {
-        MKL_LONG status = DftiCreateDescriptor(&handle_, DFTI_DOUBLE, DFTI_REAL,
+        // DftiCreateDescriptor is a macro, so the precision is computed
+        // first: a template argument list would split its arguments.
+        const DFTI_CONFIG_VALUE precision =
+            std::is_same<Real, float>::value ? DFTI_SINGLE : DFTI_DOUBLE;
+        MKL_LONG status = DftiCreateDescriptor(&handle_, precision, DFTI_REAL,
                                                1, static_cast<MKL_LONG>(n));
         if (status == 0)
             status = DftiSetValue(handle_, DFTI_CONJUGATE_EVEN_STORAGE,
@@ -425,7 +434,7 @@ class DftiPlan {
     DftiPlan(const DftiPlan&) = delete;
     DftiPlan& operator=(const DftiPlan&) = delete;
 
-    void forward(double* data) const {
+    void forward(Real* data) const {
         if (DftiComputeForward(handle_, data) != 0)
             throw std::runtime_error("MKL DFTI forward transform failed");
     }
@@ -442,11 +451,18 @@ static_assert(kTileFrames % kFftBatch == 0, "batch must divide the tile");
 // Tiles handed out per scheduling step.
 constexpr std::size_t kTilesPerClaim = 2;
 
+// Real is the FFT working precision; the Mel accumulation is always double.
+//
+// prepare_output() sizes the (zero-initialized) output and returns its data.
+// Worker 0 runs it while the other workers already compute tiles, which they
+// keep in a private stash until the output is ready, so the single-threaded
+// zero fill of the output overlaps with the FFT work.
+template <typename Real, typename PrepareOutput>
 void compute_with_mkl(const double* samples, std::size_t n_frames,
                       std::size_t fft_size, std::size_t hop,
                       const MelWeights& mel, const std::vector<double>& window,
-                      std::size_t requested_threads, double* output,
-                      bool trace) {
+                      std::size_t requested_threads,
+                      PrepareOutput&& prepare_output, bool trace) {
     const std::size_t n_bins = fft_size / 2 + 1;
     std::size_t active_first = n_bins;
     std::size_t active_end = 0;
@@ -457,7 +473,7 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
     }
     const std::size_t mel_count = mel.bands.size();
     if (active_end <= active_first) {
-        std::fill(output, output + mel_count * n_frames, 0.0);
+        prepare_output();  // every Mel band is empty: all zeros
         return;
     }
     const std::size_t active_bins = active_end - active_first;
@@ -472,12 +488,56 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
 
     using Clock = std::chrono::steady_clock;
     const Clock::time_point launch = Clock::now();
-    std::vector<double> worker_times(trace ? 2 * workers : 0);
+    std::vector<double> worker_times(trace ? 3 * workers : 0);
+
+    enum : int { kPending, kReady, kFailed };
+    std::atomic<int> output_state{kPending};
+    double* output = nullptr;  // published by output_state (release/acquire)
+
     run_workers(workers, [&](std::size_t worker) {
-        const DftiPlan plan(fft_size, kFftBatch);
+        if (worker == 0) {
+            try {
+                output = prepare_output();
+            } catch (...) {
+                output_state.store(kFailed, std::memory_order_release);
+                throw;
+            }
+            output_state.store(kReady, std::memory_order_release);
+        }
+        bool ready = worker == 0;
+        std::vector<std::pair<std::size_t, std::vector<double>>> stash;
+        std::size_t stashed_tiles = 0;
+        const auto store_tile = [&](std::size_t tile, const double* values) {
+            const std::size_t frame0 = tile * kTileFrames;
+            const std::size_t count = std::min(kTileFrames, n_frames - frame0);
+            for (std::size_t m = 0; m < mel_count; ++m) {
+                const double* row = values + m * kTileFrames;
+                double* destination = output + m * n_frames + frame0;
+                for (std::size_t f = 0; f < count; ++f)
+                    destination[f] = row[f];
+            }
+        };
+        // Returns false if the output could not be prepared.
+        const auto become_ready = [&](bool wait) {
+            int state = output_state.load(std::memory_order_acquire);
+            while (wait && state == kPending) {
+                std::this_thread::yield();
+                state = output_state.load(std::memory_order_acquire);
+            }
+            if (state == kReady) {
+                ready = true;
+                for (const auto& entry : stash)
+                    store_tile(entry.first, entry.second.data());
+                stash.clear();
+            }
+            return state != kFailed;
+        };
+
+        std::vector<Real> window_real(window.begin(), window.end());
+        const DftiPlan<Real> plan(fft_size, kFftBatch);
         const Clock::time_point planned = Clock::now();
-        std::vector<double> buffer(stride * kFftBatch);
-        std::vector<double> power(active_bins);
+        std::vector<Real> buffer(stride * kFftBatch);
+        std::vector<Real> power(active_bins);
         std::vector<double> tile_out(mel_count * kTileFrames);
 
         double stage[4] = {0, 0, 0, 0};
@@ -490,6 +550,7 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         };
 
         for (;;) {
+            if (!ready && !become_ready(false)) return;
             const std::size_t claim =
                 next_claim.fetch_add(1, std::memory_order_relaxed);
             if (claim >= claims) break;
@@ -507,9 +568,9 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                     for (std::size_t b = 0; b < kFftBatch; ++b) {
                         const std::size_t f = std::min(batch0 + b, count - 1);
                         const double* src = samples + (frame0 + f) * hop;
-                        double* data = buffer.data() + b * stride;
+                        Real* data = buffer.data() + b * stride;
                         for (std::size_t i = 0; i < fft_size; ++i)
-                            data[i] = src[i] * window[i];
+                            data[i] = static_cast<Real>(src[i]) * window_real[i];
                     }
                     lap(0);
                     plan.forward(buffer.data());
@@ -517,11 +578,11 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                     const std::size_t batch_count =
                         std::min(kFftBatch, count - batch0);
                     for (std::size_t b = 0; b < batch_count; ++b) {
-                        const double* bin =
+                        const Real* bin =
                             buffer.data() + b * stride + 2 * active_first;
                         for (std::size_t k = 0; k < active_bins; ++k) {
-                            const double re = bin[2 * k];
-                            const double im = bin[2 * k + 1];
+                            const Real re = bin[2 * k];
+                            const Real im = bin[2 * k + 1];
                             power[k] = re * re + im * im;
                         }
                         lap(2);
@@ -530,7 +591,7 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                             const MelBand& band = mel.bands[m];
                             const double* weights =
                                 mel.values.data() + band.offset;
-                            const double* p =
+                            const Real* p =
                                 power.data() + (band.first - active_first);
                             const std::size_t length = band.end - band.first;
                             double sum = 0.0;
@@ -541,20 +602,22 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                         lap(3);
                     }
                 }
-                for (std::size_t m = 0; m < mel_count; ++m) {
-                    const double* row = tile_out.data() + m * kTileFrames;
-                    double* destination = output + m * n_frames + frame0;
-                    for (std::size_t f = 0; f < count; ++f)
-                        destination[f] = row[f];
+                if (ready) {
+                    store_tile(tile, tile_out.data());
+                } else {
+                    stash.emplace_back(tile, tile_out);
+                    ++stashed_tiles;
                 }
                 lap(3);
             }
         }
+        if (!ready && !become_ready(true)) return;
         if (trace) {
-            worker_times[2 * worker] =
+            worker_times[3 * worker] =
                 std::chrono::duration<double>(planned - launch).count();
-            worker_times[2 * worker + 1] =
+            worker_times[3 * worker + 1] =
                 std::chrono::duration<double>(Clock::now() - launch).count();
+            worker_times[3 * worker + 2] = static_cast<double>(stashed_tiles);
             if (worker == 0)
                 std::fprintf(
                     stderr,
@@ -563,15 +626,16 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         }
     });
     if (trace) {
-        double lo[2] = {1e9, 1e9}, hi[2] = {0, 0};
+        double lo[3] = {1e9, 1e9, 1e9}, hi[3] = {0, 0, 0};
         for (std::size_t w = 0; w < workers; ++w)
-            for (int i = 0; i < 2; ++i) {
-                lo[i] = std::min(lo[i], worker_times[2 * w + i]);
-                hi[i] = std::max(hi[i], worker_times[2 * w + i]);
+            for (int i = 0; i < 3; ++i) {
+                lo[i] = std::min(lo[i], worker_times[3 * w + i]);
+                hi[i] = std::max(hi[i], worker_times[3 * w + i]);
             }
         std::fprintf(stderr,
-                     "trace workers %zu planned %.4f..%.4f done %.4f..%.4f\n",
-                     workers, lo[0], hi[0], lo[1], hi[1]);
+                     "trace workers %zu planned %.4f..%.4f done %.4f..%.4f "
+                     "stashed %.0f..%.0f\n",
+                     workers, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
     }
 }
 #endif
@@ -659,7 +723,31 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         input = &alias_input;
     }
     const double* input_samples = input->data();
+
+    std::vector<double> window(fft_size);
+    for (std::size_t i = 0; i < fft_size; ++i) {
+        window[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * static_cast<double>(i) /
+                                          static_cast<double>(fft_size)));
+    }
     trace.mark("setup");
+
+#if MELSPEC_MKL
+    if (n_fft > 1) {
+        using FftReal =
+            std::conditional<MELSPEC_FFT_FLOAT != 0, float, double>::type;
+        compute_with_mkl<FftReal>(
+            input_samples, n_frames, fft_size, hop, mel, window,
+            requested_threads,
+            [&] {
+                output.resize(output_count);
+                return output.data();
+            },
+            trace.enabled());
+        trace.mark("kernel");
+        return;
+    }
+#endif
+
     output.resize(output_count);
     trace.mark("output_resize");
 
@@ -668,20 +756,6 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         std::fill(output.begin(), output.end(), 0.0);
         return;
     }
-
-    std::vector<double> window(fft_size);
-    for (std::size_t i = 0; i < fft_size; ++i) {
-        window[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * static_cast<double>(i) /
-                                          static_cast<double>(fft_size)));
-    }
-
-#if MELSPEC_MKL
-    trace.mark("window");
-    compute_with_mkl(input_samples, n_frames, fft_size, hop, mel, window,
-                     requested_threads, output.data(), trace.enabled());
-    trace.mark("kernel");
-    return;
-#endif
 
     const std::size_t half_fft = fft_size / 2;
     const std::size_t n_bins = half_fft + 1;

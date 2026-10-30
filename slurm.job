@@ -1,10 +1,16 @@
 #!/bin/bash
 #SBATCH -J Melspec
-#SBATCH -w hepnode[1-3]
+#SBATCH -p hepnodes
 #SBATCH -N 1
-#SBATCH -n 16
+#SBATCH -n 1
+#SBATCH -c 64
+#SBATCH --exclusive
 #SBATCH --output=logs/%j.out
 #SBATCH --error=logs/%j.err
 
+# One process using every core of the node: the program starts one worker per
+# CPU in its affinity mask (override with MELSPEC_THREADS). Build on the
+# compute node so -march=native matches the CPU that runs the program.
 # active your env here
+make clean
 make test

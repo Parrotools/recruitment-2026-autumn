@@ -508,3 +508,33 @@ job 117 最终 `FAILED 141:0` 的原因是末尾诊断 shell 管道的 SIGPIPE�
 | 单线程分阶段（narrow_band，每帧） | 加窗 7.6 µs、FFT 36.3 µs、power 3.2 µs、Mel 2.5 µs | 16384 点 FFT 的工作集变大，FFT 占约 73% |
 | MKL 与手写 FFT（单线程 default compute） | 4.94 s 与 5.06 s | 在这台机器上，手写跨帧 AVX2 radix-2 与 MKL 单帧 r2c 基本持平；单换 FFT 库不是突破口 |
 
+### R4 优化 1：动态 tile 调度 + 行布局 power + tile 化 Mel 输出（job 150）
+
+根据上面的 profile 做了三处改动（`compute_with_mkl`）：
+
+1. **动态调度**：不再把连续帧静态均分给 worker，而是用一个 `std::atomic<size_t>` 计数器，每次领取 2 个 tile（32 帧）。领取粒度足够大，原子操作开销可忽略（全程约 6000 次 `fetch_add`）；同时快线程自动多干，NUMA 远端、降频或被系统打断的线程少干。
+2. **power 改成每帧连续的一行**：`|X[k]|²` 直接写到连续数组，去掉了之前 `[bin][frame]` 转置写的 cache line 浪费；Mel 对每个滤波器做连续 bin 的点积，求和顺序仍是 bin 升序。
+3. **Mel 结果先放进 `[mel][16 帧]` 的 tile（256×16×8 B = 32 KiB，放得进 L1/L2）**，tile 完成后每个 Mel 行连续写 16 个 double 到输出，避免每帧在输出中跨 256 行写入。
+
+| 指标（hepnode2，64 线程） | 改动前 (job 148) | 改动后 (job 150) |
+|---|---:|---:|
+| default kernel | 0.145 s | **0.083 s** |
+| default worker 完成时间范围 | 0.084–0.145 s | 0.080–0.083 s |
+| narrow_band kernel | 0.225 s | **0.164 s** |
+| 单线程 default power 阶段 | 0.73 s | 0.16 s |
+
+不均衡基本消除（最慢 worker 只比最快慢 4%）。改动后 64 线程 worker 0 的分解为加窗 0.010 s、FFT 0.048 s、power 0.003 s、Mel+写出 0.011 s，**FFT 占约 2/3**，成为唯一的大头。
+
+### R4 优化 2：把输出清零与 FFT 计算重叠
+
+`std::vector<double>::resize()` 必须对 394 MB 输出做值初始化，标准库会在调用线程上单线程 memset，64 线程时实测 0.025–0.028 s，约占 compute 的 1/4。这一步无法省略（接口固定为 `std::vector<double>&`，`main.cpp` 不可改），但可以与计算重叠：
+
+- 先在 `compute_melspectrogram` 中完成参数校验、Mel 权重、Hann 窗等准备工作，再把 `output.resize()` 包成 `prepare_output` 回调交给 `compute_with_mkl`。
+- worker 0（即调用线程）先执行 resize，完成后通过 `std::atomic<int>` 以 release 语义发布 `kReady`；其他 63 个 worker 一启动就创建 DFTI plan、领取 tile 计算，输出还没准备好时，把 32 KiB 的 tile 结果暂存在私有 `stash` 中，每领取一次任务检查一次状态（acquire），一旦就绪先 flush stash 再直接写。
+- 若 resize 抛出（如 `bad_alloc`），worker 0 发布 `kFailed` 后重新抛出，其他 worker 看到后直接退出，`run_workers` join 后把异常传给调用方，不会死等。
+- alias（输入与输出是同一个 vector）路径在任何 worker 启动前已复制输入，worker 只读副本，resize 不会影响它们。
+
+### R4 实验开关：分配器触页线程数
+
+`HUGE_ALLOC` 分配器对 ≥1 MiB 的分配做 2 MiB 对齐 mmap + `MADV_HUGEPAGE`，然后多线程预先触页。原来硬编码最多 16 个触页线程；在 64 核节点上新增编译期参数 `MELSPEC_TOUCH_THREADS`（默认仍为 16），用来测试 32/64 线程能否进一步缩短 `main.cpp` 中 `y`、`out_f32` 等大 vector 的分配时间。
+
