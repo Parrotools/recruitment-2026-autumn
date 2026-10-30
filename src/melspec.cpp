@@ -520,9 +520,9 @@ void frequency_window_power(const DftiPlan<Real>& plan, const double* frame,
 // Real is the FFT working precision; the Mel accumulation is always double.
 //
 // prepare_output() sizes the (zero-initialized) output and returns its data.
-// Worker 0 runs it while the other workers already compute tiles, which they
-// keep in a private stash until the output is ready, so the single-threaded
-// zero fill of the output overlaps with the FFT work.
+// Worker 1 (worker 0 if alone) runs it while the others already compute tiles,
+// which they keep in a private stash until the output is ready, so the
+// single-threaded zero fill of the output overlaps with the FFT work.
 template <typename Real, typename PrepareOutput>
 void compute_with_mkl(const double* samples, std::size_t n_frames,
                       std::size_t fft_size, std::size_t hop,
@@ -560,8 +560,26 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
     std::atomic<int> output_state{kPending};
     double* output = nullptr;  // published by output_state (release/acquire)
 
+    // Two serial set-up jobs overlap the FFT work: one worker sizes (and so
+    // zero-fills) the output while the others compute into private stashes,
+    // and worker 0 -- the calling thread -- faults in the float copy that
+    // main.cpp's write_output allocates next. That copy has to be first
+    // touched by the calling thread: the conversion loop there writes all of
+    // it, and remote NUMA writes cost more than the saved faults. Doing the
+    // two jobs on different workers keeps either from outlasting the
+    // shortest kernels.
+    const std::size_t preparer = workers > 1 ? 1 : 0;
+    const auto reserve_float_copy = [&] {
+#if MELSPEC_HAS_RESERVE
+        if (melspec_reserve_allocation != nullptr)
+            melspec_reserve_allocation(mel_count * n_frames * sizeof(float));
+#endif
+    };
     run_workers(workers, [&](std::size_t worker) {
-        if (worker == 0) {
+        // The output is twice the float copy's size, so its allocation
+        // never takes the reserved block.
+        if (worker == 0 && preparer != 0) reserve_float_copy();
+        if (worker == preparer) {
             try {
                 output = prepare_output();
             } catch (...) {
@@ -569,18 +587,9 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 throw;
             }
             output_state.store(kReady, std::memory_order_release);
-#if MELSPEC_HAS_RESERVE
-            // main.cpp's write_output next allocates a float copy of the
-            // output. Fault its pages in now, while the other workers keep
-            // the cores busy, instead of on the serial write path; worker 0
-            // is the calling thread, so they are also NUMA-local to the
-            // conversion loop there. Dynamic tile claiming absorbs the delay.
-            if (melspec_reserve_allocation != nullptr)
-                melspec_reserve_allocation(mel_count * n_frames *
-                                           sizeof(float));
-#endif
+            if (preparer == 0) reserve_float_copy();
         }
-        bool ready = worker == 0;
+        bool ready = worker == preparer;
         std::vector<std::pair<std::size_t, std::vector<double>>> stash;
         std::size_t stashed_tiles = 0;
         const auto store_tile = [&](std::size_t tile, const double* values) {
