@@ -8,9 +8,10 @@
 | R2 候选 B | 按实际 Mel 频带范围裁剪无需读取的高频对称 power 重构；其余情况走完整重构。源文件 SHA256 `0734a650a461aa271a2c4555d3b93e16b399ca78b68e03f2887d882077db7b29`。 | 已通过集群 job 48 的四组正式 expected 校验及 job 51 的七轮端到端测量。8 核 hepnode3 上，AVX2 组 narrow 的 round1/B 配对比为 `1.03391`，HUGE_ALLOC 组为 `1.04917`；这是配对耗时比，1 表示相同，值大于 1 表示 B 耗时较低。 |
 | R2 allocator | `HUGE_ALLOC=1` 的 Linux 全局大块分配器。 | 保持默认关闭。已测 binary `round2/cluster/build/validation-48/B_huge/melspec` SHA256 `ed9dcd655f82d14fffe291db48edc97bec67cefaaecda02fd0a807c00cdaccd5`；其 correctness 与性能证据适用于当时 hepnode3/GCC 配置，不代表其他机器。 |
 | R3 候选 F/V | F 为相邻两级 radix-2 FFT 融合；V 为显式 AVX-512F、8 帧 lane；FV 合用。当前源码 SHA256 `712867d887e9af3b214806079ef72aa2220adddafeec08017359772d1271cce5`，实验开关均默认关闭。 | 五种候选配置只完成构建和定向 unit-test；尚无候选 NumPy 全集、正式 expected、四 case 筛选或确认轮性能结论。R3 tester 尚未提交正式计算作业。 |
-| **R4 当前默认** | 用满 64 核；MKL DFTI 单帧 r2c（检测到 MKL 时默认启用，静态顺序链接）；原子计数器动态 tile 调度；行布局 power + `[mel][16]` tile 输出；输出清零与计算重叠；`write_output` 的 float 副本在 compute 中预触页。`HUGE_ALLOC`、`-march=native` 在 Linux 默认开启。 | 集群 hepnode3 独占 64 核（job 207），`validate.py --runs 5` 两轮四组全部 PASS，误差与 R2 逐位相同。default/small_mels/large_fft/narrow_band 为 **0.307/0.188/0.403/0.384 s**（R2 B_huge 同条件 0.370/0.226/0.450/0.442 s）。详见文末“第四轮”。 |
+| R4 | 用满 64 核；MKL DFTI 单帧 r2c（检测到 MKL 时默认启用，静态顺序链接）；原子计数器动态 tile 调度；行布局 power + `[mel][16]` tile 输出；输出清零与计算重叠；`write_output` 的 float 副本在 compute 中预触页。`HUGE_ALLOC`、`-march=native` 在 Linux 默认开启。 | 集群 hepnode3 独占 64 核（job 207），`validate.py --runs 5` 两轮四组全部 PASS，误差与 R2 逐位相同。default/small_mels/large_fft/narrow_band 为 **0.307/0.188/0.403/0.384 s**（R2 B_huge 同条件 0.370/0.226/0.450/0.442 s）。详见文末“第四轮”。 |
+| **R5 当前默认** | 在 R4 基础上把周期 Hann 窗移到频域：DFTI out-of-place 直接读输入样本，`Y[k] = X[k]/2 - (X[k-1]+X[k+1])/4` 只在活跃 bin 上计算（开关 `MELSPEC_FREQ_WINDOW`，默认 1）。 | job 213 独占 64 核，四组全部 PASS，误差与 R4 逐位相同；default/small_mels/large_fft/narrow_band 为 **0.285–0.294 / 0.180–0.183 / 0.362 / 0.348–0.350 s**（R4 同作业 0.287–0.293 / 0.193–0.194 / 0.386–0.394 / 0.380–0.390 s）。详见文末“第五轮”。 |
 
-第四轮之后，默认构建（`make`）就是上表 R4 行的配置：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
+第五轮之后，默认构建（`make`）就是上表 R5 行的配置（R4 全部内容加频域加窗）：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
 
 ## 范围和实现摘要
 
@@ -691,3 +692,65 @@ R4 默认的 64 线程阶段时间（`benchmark_compute`，3 次）：default re
 **复现。** 在集群上 `sbatch slurm.job`（`-c 64 --exclusive`，内容为 `make clean; make test`）。默认构建自动使用 spack 中的 oneMKL 2026.0；也可 `make MKLROOT=...` 指定其他 MKL，`make MKL=0` 回到手写 FFT 路径。实验脚本和全部日志在集群 `~/workspace/melspec-optimization-20261029/round4/`（`jobs/`、`results/`）。
 
 **AI 使用说明。** 第四轮的代码、实验设计、集群作业和本节文字由 AI（Claude）在用户指导下完成；用户提供了集群与个人测试机，并给出了约束（不改 `main.cpp`/`validate.py`/`data`、不要跑原始实现等）。所有数字都来自上文列出的作业日志。
+
+## 第五轮：继续压缩 compute 与串行路径
+
+### R5 想法 1：把 Hann 窗移到频域，FFT 直接读输入
+
+周期 Hann 窗可以写成三个复指数之和：
+
+$$w[n] = \tfrac12 - \tfrac14 e^{2\pi i n/N} - \tfrac14 e^{-2\pi i n/N}$$
+
+所以加窗帧的 DFT 精确等于未加窗 DFT 的三点组合：
+
+$$Y[k] = \tfrac12 X[k] - \tfrac14\left(X[k-1] + X[k+1]\right)$$
+
+其中 $X[-1] = \overline{X[1]}$、$X[N/2+1] = \overline{X[N/2-1]}$（实信号的共轭对称）。这是恒等变形，不是近似；`melspec.py` 用的是 `get_window('hann', n_fft, fftbins=True)`，代码里的窗是 `0.5 * (1 - cos(2πi/N))`，分母是 N，正是周期形式，恒等式成立。
+
+实现上的收益：
+
+- 原来每帧要先把 N 个样本乘窗写进 FFT 缓冲区（in-place 变换会覆盖输入，这一份拷贝省不掉）。现在 DFTI 设成 `DFTI_NOT_INPLACE`，直接从 `samples + frame * hop` 读，结果写到两端各多留一个复数的频谱缓冲区。
+- 两端的保护元素用共轭对称填好后，三点组合和 `|·|²` 在一个无分支循环里完成，而且只算 Mel 会用到的活跃 bin（default 46%、narrow_band 17%），不是全部 N/2+1 个。
+- 编译开关 `MELSPEC_FREQ_WINDOW`（默认 1），只在 double、非批量路径生效（float 路径必须先把 double 输入转成 float，拷贝仍然存在）。
+
+第一版实现有一个控制流错误：在频域分支末尾写了 `continue`，跳过了同一 tile 循环里随后的 `store_tile`，输出全为 0。自带单元测试立即报出 `actual=0.000000 expected=0.139371`；改为 `if constexpr … else` 后通过。单元测试以 2e-9 的相对容差对照直接 DFT 参考，说明频域加窗的数值误差远小于 validate 容差。
+
+prometheus 上（32 线程，3 次）：误差余量与原来逐位相同（0.0005/0.0008/0.0008/0.0006）；narrow_band kernel 0.62 → 0.54 s（−14%），default 持平（0.29–0.30 s）。在 AMD 上 MKL 的 out-of-place 变换略慢，抵消了 default 省下的加窗时间；Xeon 上的结果见集群作业。
+
+### R5 想法 2：输出数组在主线程所在 NUMA 节点上触页
+
+`output`（394 MB）原来由分配器的 16 个辅助线程预触页，这些线程被内核分散到 4 个 NUMA 节点上；之后 `main.cpp` 的单线程转换循环读整个数组，大部分是跨节点访问。另外，worker 0 执行 `output.resize()` 时，这 16 个触页线程会和 63 个计算 worker 抢核。
+
+改法是复用上一轮的预留机制：worker 0 在 `prepare_output()` 之前先 `melspec_reserve_allocation(输出字节数)`（单线程触页），`resize` 的分配直接取走这块内存。页面因此都在主线程所在节点上，也不再额外起线程。worker 0 多花的时间仍然由动态调度吸收。编译开关 `MELSPEC_LOCAL_OUTPUT`（默认 1）。prometheus（单 NUMA）上 default kernel 快 2–6%，来源只可能是去掉了线程争抢；NUMA 方面的效果要在集群上看。
+
+### R5 一次误判：plan 创建并不慢
+
+64 线程 trace 里 `planned` 的最大值达到 0.07–0.11 s，与 kernel 时间同量级，一度怀疑 `DftiCommitDescriptor` 内部加锁导致串行化。写了一个微基准：8192/16384 点单次 commit 0.4–3.6 ms，32 个线程并发 commit 全部在 2.3 ms 内完成，用 `DftiCopyDescriptor` 也一样。原因其实是 worker 0：它先执行 `resize` 和预留，最后才建 plan，所以 `planned` 的最大值是 worker 0 的，这正是有意安排的重叠，不是问题。记录下来，避免以后再误判。
+
+### R5 集群对比（job 213，hepnode3，`--exclusive` 64 核）
+
+四个版本：`r1` = 上一轮提交（HEAD）；`fw1` = 频域加窗；`lo0` = 只做 NUMA 本地输出；`lo` = 两者都做。单元测试全部 PASS，`lo` 的误差余量与 r1 逐位相同（频域加窗不改变误差统计）。
+
+**compute 阶段（`benchmark_compute`，3 次，s）**
+
+| case | r1 | fw1 | lo0 | lo |
+|---|---|---|---|---|
+| default | 0.089 / 0.089 / 0.110 | **0.086 / 0.078 / 0.080** | 0.113 / 0.123 / 0.114 | 0.112 / 0.112 / 0.116 |
+| large_fft | 0.205 / 0.200 / 0.194 | **0.153 / 0.153 / 0.154** | 0.196 / 0.191 / 0.195 | 0.162 / 0.160 / 0.163 |
+| narrow_band | 0.172 / 0.176 / 0.181 | **0.136 / 0.134 / 0.142** | 0.170 / 0.176 / 0.190 | 0.144 / 0.141 / 0.151 |
+
+**`validate.py --runs 5`，两轮（s）**
+
+| 版本 | default | small_mels | large_fft | narrow_band |
+|---|---|---|---|---|
+| r1 | 0.293 / 0.287 | 0.194 / 0.193 | 0.386 / 0.394 | 0.390 / 0.380 |
+| **fw1** | 0.285 / 0.294 | **0.183 / 0.180** | **0.362 / 0.362** | **0.350 / 0.348** |
+| lo | 0.318 / 0.317 | 0.182 / 0.182 | 0.364 / 0.362 | 0.351 / 0.343 |
+| lo0 | 0.331 / 0.318 | 0.194 / 0.190 | 0.402 / 0.396 | 0.377 / 0.382 |
+
+结论：
+
+1. **频域加窗采用。** 在 Xeon 上 out-of-place 变换没有变慢，省掉的加窗拷贝直接体现为 compute 缩短：large_fft −24%，narrow_band −22%，default −10%；端到端 large_fft/narrow_band 快 7–9%，small_mels 快 6%，default 在噪声内（compute 只占它的 1/3）。
+2. **NUMA 本地输出放弃。** trace 显示 `lo`/`lo0` 的 default 中 worker 完成时间是 `0.084..0.111`，最晚的正是 worker 0：它要单线程触页 394 MB、做 memset，再给 float 副本触页 197 MB，这段串行工作超过了 default 整个 kernel 的时长，动态调度已经无法吸收。写阶段也没有因为页面在本地而变快（0.14–0.15 s 不变），说明单线程转换循环不受远端访问限制。代码已删除。
+
+这一轮说明：把串行工作"藏"到 worker 0 上是有预算的，预算就是其他 worker 的计算时间。default 的 kernel 只有约 0.08 s，worker 0 上的 resize（约 0.027 s）加 float 预留已经接近上限。
