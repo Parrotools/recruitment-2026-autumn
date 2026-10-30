@@ -754,3 +754,40 @@ prometheus 上（32 线程，3 次）：误差余量与原来逐位相同（0.00
 2. **NUMA 本地输出放弃。** trace 显示 `lo`/`lo0` 的 default 中 worker 完成时间是 `0.084..0.111`，最晚的正是 worker 0：它要单线程触页 394 MB、做 memset，再给 float 副本触页 197 MB，这段串行工作超过了 default 整个 kernel 的时长，动态调度已经无法吸收。写阶段也没有因为页面在本地而变快（0.14–0.15 s 不变），说明单线程转换循环不受远端访问限制。代码已删除。
 
 这一轮说明：把串行工作"藏"到 worker 0 上是有预算的，预算就是其他 worker 的计算时间。default 的 kernel 只有约 0.08 s，worker 0 上的 resize（约 0.027 s）加 float 预留已经接近上限。
+
+### R5 系统层面的检查（job 218，hepnode3，独占 64 核）
+
+**THP 与缺页。** 节点的 `transparent_hugepage/enabled` 与 `defrag` 都是 `madvise`，所以分配器的 `MADV_HUGEPAGE` 生效，缺页时允许直接整理内存拿到大页。`/usr/bin/time` 统计整个进程（default）约 3.9–5.3 万次 minor fault，大头来自 <1 MiB 的小块分配和 MKL 内部缓冲；如果 700 MB 的大数组没拿到大页，仅它们就会有约 17 万次缺页。
+
+**集群上的 I/O 拆分（`tests/io_breakdown.cpp`，HUGE_ALLOC，3 次取典型值，s）**
+
+| 触页线程 | buf 分配 | 读文件 | y 分配 | int16→double | out_f32 分配 | double→float | 写 tmpfs |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 0.009–0.011 | 0.026–0.030 | 0.041–0.042 | 0.020 | 0.032 | 0.041–0.042 | 0.072 |
+| 4 | 0.006–0.007 | 0.026–0.029 | 0.027 | 0.020–0.021 | 0.018–0.019 | 0.045–0.046 | 0.074–0.075 |
+| 16 | 0.005–0.006 | 0.024–0.028 | 0.024–0.025 | 0.021–0.022 | 0.014–0.015 | 0.049–0.051 | 0.076–0.078 |
+
+16 线程触页对分配步骤最好，维持默认。分配器能影响的两个分配步骤已接近下限（out_f32 在真实程序里已由 R4 预留机制移出串行路径）。剩下的读文件、两次类型转换和写 tmpfs 都是 `main.cpp` 里的串行代码或内核拷贝，合计约 0.19 s，是当前 default 0.28 s 的主体。
+
+注意 double→float 转换在 16 线程触页时反而慢约 8 ms：测试程序里 `data` 被 16 个线程分散触页到 4 个 NUMA 节点，单线程读它要跨节点。但 R5 的 `lo` 实验已经表明，把真实程序的 `output` 放到本地节点，写阶段并没有变快，所以这一点不值得用 worker 0 的串行时间去换。
+
+**MKL 指令集。** `MKL_ENABLE_INSTRUCTIONS=AVX512` 与默认的 compute 时间相同（default 0.080–0.085 s、large_fft 0.153–0.159 s），`=AVX2` 时慢 10–15%（0.090–0.094 / 0.172–0.181 s）。MKL 在这颗 Ice Lake 上已经自动选了 AVX-512 代码路径，无需改动。
+
+**线程绑核（新开关 `MELSPEC_PIN`，默认 0）。** worker i 绑定到进程可用的第 i 个 CPU（节点上 0–15、16–31、32–47、48–63 各为一个 NUMA 节点），计算结束后恢复调用线程原来的 mask（RAII，异常时也恢复）。第一版结果：
+
+| | default compute | large_fft compute | validate default | validate large_fft | validate narrow_band |
+|---|---|---|---|---|---|
+| 不绑核 | 0.078–0.083 | 0.153–0.155 | 0.282 / 0.283 | 0.363 / 0.368 | 0.354 / 0.353 |
+| 绑核 v1 | 0.116–0.120 | 0.149–0.151 | 0.324 / 0.330 | 0.352 / 0.358 | 0.342 / 0.347 |
+
+large_fft/narrow_band 快约 3%，default 却变慢 40%，trace 中最后完成的是 worker 0。原因是 worker 0 先把自己绑到 CPU 0，然后才执行 `output.resize()`，分配器起的 16 个触页辅助线程继承了这个 affinity，全部挤在 CPU 0 上，相当于串行触页 394 MB。改为 worker 0 在准备完输出、做完预留之后再绑核（v2），见下一个作业。
+
+**绑核 v2（job 219）。** worker 0 改为准备完输出后再绑核。compute（3 次）：small_mels 0.073–0.078 vs 不绑核 0.075–0.080；default 0.101–0.107 vs 0.080–0.106；large_fft 0.145–0.158 vs 0.151–0.166；narrow_band 0.140 vs 0.139–0.144。validate 三轮互有胜负（default 0.311/0.287/0.306 vs 0.286/0.303/0.306；large_fft 0.372/0.366/0.366 vs 0.364/0.377/0.371）。v1 在 large_fft 上的 3% 没有复现，绑核不采用，代码已删除。
+
+### R5 优化：float 副本的预留交给 worker 1
+
+job 219 的 trace 还暴露了一个和绑核无关的问题：不绑核的版本 default 也有一次 compute 达到 0.106 s，最后完成的仍是 worker 0。worker 0 上串行排着两件事：`output.resize()`（394 MB 触页 + memset）和 R4 加入的 float 副本预留（197 MB 单线程触页），两者加起来接近 default 整个 kernel 的时长（约 0.08 s），动态调度吸收不了，所以偶尔出现 25 ms 左右的拖尾。
+
+这两件事互不依赖，且 R5 `lo` 实验已经说明 float 副本放在哪个 NUMA 节点无关紧要，所以把预留改由 worker 1 在启动时执行，与 worker 0 的 resize 并行（只有 1 个 worker 时仍由 worker 0 在 resize 之前做）。output 的字节数是 float 副本的两倍，大于预留块容量，`operator new` 的取用条件保证 resize 不会误拿这块内存。prometheus 上单元测试通过，`MELSPEC_THREADS=1` 与 32 线程的输出逐字节相同。集群对比见 job 221。
+
+**结果（job 221，独占 64 核）。** compute 中的拖尾确实消失了（default 0.080–0.082 s，worker 完成时间极差 ≤2 ms），但端到端 validate 的 default 三轮都变慢：0.303/0.306/0.306 s，不移的版本是 0.289/0.295/0.281 s；其余三组在噪声内。差别来自写阶段：float 副本的页面改由 worker 1 首次触碰后，落在 worker 1 所在的 NUMA 节点上，而 `main.cpp` 的转换循环要在主线程上逐个**写**这个数组。R5 `lo` 实验只说明了远端**读**（`output`）影响不大；远端写的代价明显更高。所以 float 副本必须由主线程（worker 0）预触页，这一改动撤回。偶尔出现的 worker 0 拖尾（约 1/3 的运行多 20 ms 左右）是这个选择的代价，平均来看仍然划算。
