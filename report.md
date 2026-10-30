@@ -9,9 +9,9 @@
 | R2 allocator | `HUGE_ALLOC=1` 的 Linux 全局大块分配器。 | 保持默认关闭。已测 binary `round2/cluster/build/validation-48/B_huge/melspec` SHA256 `ed9dcd655f82d14fffe291db48edc97bec67cefaaecda02fd0a807c00cdaccd5`；其 correctness 与性能证据适用于当时 hepnode3/GCC 配置，不代表其他机器。 |
 | R3 候选 F/V | F 为相邻两级 radix-2 FFT 融合；V 为显式 AVX-512F、8 帧 lane；FV 合用。当前源码 SHA256 `712867d887e9af3b214806079ef72aa2220adddafeec08017359772d1271cce5`，实验开关均默认关闭。 | 五种候选配置只完成构建和定向 unit-test；尚无候选 NumPy 全集、正式 expected、四 case 筛选或确认轮性能结论。R3 tester 尚未提交正式计算作业。 |
 | R4 | 用满 64 核；MKL DFTI 单帧 r2c（检测到 MKL 时默认启用，静态顺序链接）；原子计数器动态 tile 调度；行布局 power + `[mel][16]` tile 输出；输出清零与计算重叠；`write_output` 的 float 副本在 compute 中预触页。`HUGE_ALLOC`、`-march=native` 在 Linux 默认开启。 | 集群 hepnode3 独占 64 核（job 207），`validate.py --runs 5` 两轮四组全部 PASS，误差与 R2 逐位相同。default/small_mels/large_fft/narrow_band 为 **0.307/0.188/0.403/0.384 s**（R2 B_huge 同条件 0.370/0.226/0.450/0.442 s）。详见文末“第四轮”。 |
-| **R5 当前默认** | 在 R4 基础上把周期 Hann 窗移到频域：DFTI out-of-place 直接读输入样本，`Y[k] = X[k]/2 - (X[k-1]+X[k+1])/4` 只在活跃 bin 上计算（开关 `MELSPEC_FREQ_WINDOW`，默认 1）；`output` 的 resize 改由 worker 1 执行，与主线程预留 float 副本并行。绑核、NUMA 本地输出、分配器偏好本地节点等尝试均未采用（见第五轮）。 | job 213 独占 64 核，四组全部 PASS，误差与 R4 逐位相同；default/small_mels/large_fft/narrow_band 为 **0.285–0.294 / 0.180–0.183 / 0.362 / 0.348–0.350 s**（R4 同作业 0.287–0.293 / 0.193–0.194 / 0.386–0.394 / 0.380–0.390 s）。详见文末“第五轮”。 |
+| **R5 当前默认** | 在 R4 基础上：周期 Hann 窗移到频域，DFTI out-of-place 直接读输入样本，`Y[k] = X[k]/2 - (X[k-1]+X[k+1])/4` 只在活跃 bin 上计算（开关 `MELSPEC_FREQ_WINDOW`，默认 1）；Mel 点积 4 帧一组累加（结果逐位不变）；`output` 的 resize 改由 worker 1 执行，与主线程预留 float 副本并行。绑核、NUMA 本地输出、分配器偏好本地节点、PERM 打包格式、两帧合并复数 FFT 等尝试均未采用（见第五轮）。 | job 235 独占 64 核，`validate --runs 5` 三轮四组全部 PASS，误差与 R4 逐位相同：default **0.284–0.287 s**、small_mels **0.179–0.183 s**、large_fft **0.359–0.368 s**、narrow_band **0.347–0.355 s**（R4 最终验收 job 207：0.307 / 0.188 / 0.403 / 0.384 s）。 |
 
-第五轮之后，默认构建（`make`）就是上表 R5 行的配置（R4 全部内容加频域加窗）：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
+第五轮之后，默认构建（`make`）就是上表 R5 行的配置：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
 
 ## 范围和实现摘要
 
@@ -876,3 +876,14 @@ prometheus 上：单元测试通过，误差余量与原来完全相同（0.0005
 | validate large_fft | 0.368 / 0.365 / 0.359 | 0.352 / 0.357 / 0.362 |
 
 8192 点的两组明显变慢，只有 large_fft 略快，narrow_band 没有差别（四组误差统计不变；small_mels 与 narrow_band 的输出甚至逐位相同）。单核时 PERM 快 27%，64 核满载时反而慢。一个可能的解释是两条代码路径在全核频率限制和共享缓存/内存带宽下表现不同，但没有验证。按 FFT 长度选择格式的证据不足（narrow_band 无差异），不采用，代码撤回。教训：**单线程微基准只能用来筛选候选，最终必须用满载的真实程序判断**。这也是本报告一直坚持用独占节点上的 `validate.py` 做最终判断的原因。
+
+### R5 最终状态
+
+| case | 原始实现 | R2 B_huge 64 核（job 207） | R4 最终（job 207） | **R5 最终（job 235，三轮）** | 相对 R4 |
+|---|---:|---:|---:|---:|---:|
+| default | 2058 s | 0.370 | 0.307 | **0.284–0.287** | −7% |
+| small_mels | 562 s | 0.226 | 0.188 | **0.179–0.183** | −4% |
+| large_fft | 4432 s | 0.450 | 0.403 | **0.359–0.368** | −10% |
+| narrow_band | 未测 | 0.442 | 0.384 | **0.347–0.355** | −9% |
+
+第五轮采用了三项：频域加窗、Mel 4 帧一组累加、两件串行准备工作分到两个 worker。其中前两项都在 compute 内部，第三项消除了 worker 0 的拖尾。default 0.285 s 的构成约为：读 0.07 s + compute 0.077 s + 写 0.14 s。compute 中 FFT 约占 3/4，MKL 的各种配置都已在满载下比较过，当前选择最快；读写都在 `main.cpp` 中，分配器能影响的部分已接近下限。
