@@ -1,7 +1,10 @@
 #include "melspec.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <complex>
 #include <cstdlib>
 #include <exception>
@@ -137,6 +140,29 @@ Twiddles make_twiddles(std::size_t n) {
     }
     return result;
 }
+
+// Optional stage timing for profiling: set MELSPEC_TRACE=1 to print the
+// elapsed time of each compute stage to stderr.
+class StageTrace {
+   public:
+    StageTrace() : enabled_(std::getenv("MELSPEC_TRACE") != nullptr) {
+        last_ = std::chrono::steady_clock::now();
+    }
+    bool enabled() const {
+        return enabled_;
+    }
+    void mark(const char* stage) {
+        if (!enabled_) return;
+        const auto now = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "trace %s %.6f\n", stage,
+                     std::chrono::duration<double>(now - last_).count());
+        last_ = now;
+    }
+
+   private:
+    bool enabled_;
+    std::chrono::steady_clock::time_point last_;
+};
 
 bool is_power_of_two(int value) {
     return value > 0 && (value & (value - 1)) == 0;
@@ -362,15 +388,31 @@ void run_workers(std::size_t workers, Body&& body) {
 }
 
 #if MELSPEC_MKL
+#ifndef MELSPEC_MKL_BATCH
+#define MELSPEC_MKL_BATCH 1
+#endif
+
 class DftiPlan {
    public:
-    explicit DftiPlan(std::size_t n) {
+    // `batch` real transforms of length n, stored back to back with a stride
+    // of n + 2 doubles so each fits its n/2+1 complex outputs in place.
+    DftiPlan(std::size_t n, std::size_t batch) {
         MKL_LONG status = DftiCreateDescriptor(&handle_, DFTI_DOUBLE, DFTI_REAL,
                                                1, static_cast<MKL_LONG>(n));
         if (status == 0)
             status = DftiSetValue(handle_, DFTI_CONJUGATE_EVEN_STORAGE,
                                   DFTI_COMPLEX_COMPLEX);
         if (status == 0) status = DftiSetValue(handle_, DFTI_THREAD_LIMIT, 1);
+        if (status == 0 && batch > 1) {
+            status = DftiSetValue(handle_, DFTI_NUMBER_OF_TRANSFORMS,
+                                  static_cast<MKL_LONG>(batch));
+            if (status == 0)
+                status = DftiSetValue(handle_, DFTI_INPUT_DISTANCE,
+                                      static_cast<MKL_LONG>(n + 2));
+            if (status == 0)
+                status = DftiSetValue(handle_, DFTI_OUTPUT_DISTANCE,
+                                      static_cast<MKL_LONG>(n / 2 + 1));
+        }
         if (status == 0) status = DftiCommitDescriptor(handle_);
         if (status != 0) {
             if (handle_ != nullptr) DftiFreeDescriptor(&handle_);
@@ -383,8 +425,6 @@ class DftiPlan {
     DftiPlan(const DftiPlan&) = delete;
     DftiPlan& operator=(const DftiPlan&) = delete;
 
-    // In-place real-to-complex transform: `data` holds n reals on entry and
-    // n/2+1 interleaved complex values on exit.
     void forward(double* data) const {
         if (DftiComputeForward(handle_, data) != 0)
             throw std::runtime_error("MKL DFTI forward transform failed");
@@ -394,14 +434,19 @@ class DftiPlan {
     DFTI_DESCRIPTOR_HANDLE handle_ = nullptr;
 };
 
-// Frames per tile. The power tile is stored bin-major so the Mel accumulation
-// runs across the frames of a tile and each Mel row is written contiguously.
+// Frames per output tile: Mel results of a tile are gathered as
+// [mel][frame] so each Mel row is written to the output contiguously.
 constexpr std::size_t kTileFrames = 16;
+constexpr std::size_t kFftBatch = MELSPEC_MKL_BATCH;
+static_assert(kTileFrames % kFftBatch == 0, "batch must divide the tile");
+// Tiles handed out per scheduling step.
+constexpr std::size_t kTilesPerClaim = 2;
 
 void compute_with_mkl(const double* samples, std::size_t n_frames,
                       std::size_t fft_size, std::size_t hop,
                       const MelWeights& mel, const std::vector<double>& window,
-                      std::size_t requested_threads, double* output) {
+                      std::size_t requested_threads, double* output,
+                      bool trace) {
     const std::size_t n_bins = fft_size / 2 + 1;
     std::size_t active_first = n_bins;
     std::size_t active_end = 0;
@@ -416,55 +461,118 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         return;
     }
     const std::size_t active_bins = active_end - active_first;
+    const std::size_t stride = fft_size + 2;
 
     const std::size_t tiles =
         n_frames / kTileFrames + (n_frames % kTileFrames != 0 ? 1 : 0);
-    const std::size_t workers = worker_count_for(tiles, requested_threads);
+    const std::size_t claims =
+        tiles / kTilesPerClaim + (tiles % kTilesPerClaim != 0 ? 1 : 0);
+    const std::size_t workers = worker_count_for(claims, requested_threads);
+    std::atomic<std::size_t> next_claim{0};
 
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point launch = Clock::now();
+    std::vector<double> worker_times(trace ? 2 * workers : 0);
     run_workers(workers, [&](std::size_t worker) {
-        const auto range = group_range(tiles, worker, workers);
-        if (range.first == range.second) return;
-        const DftiPlan plan(fft_size);
-        std::vector<double> buffer(2 * n_bins);
-        std::vector<double> power(active_bins * kTileFrames);
-        alignas(64) double acc[kTileFrames];
+        const DftiPlan plan(fft_size, kFftBatch);
+        const Clock::time_point planned = Clock::now();
+        std::vector<double> buffer(stride * kFftBatch);
+        std::vector<double> power(active_bins);
+        std::vector<double> tile_out(mel_count * kTileFrames);
 
-        for (std::size_t tile = range.first; tile < range.second; ++tile) {
-            const std::size_t frame0 = tile * kTileFrames;
-            const std::size_t count =
-                std::min(kTileFrames, n_frames - frame0);
-            for (std::size_t f = 0; f < count; ++f) {
-                const double* src = samples + (frame0 + f) * hop;
-                double* data = buffer.data();
-                for (std::size_t i = 0; i < fft_size; ++i)
-                    data[i] = src[i] * window[i];
-                plan.forward(data);
-                const double* bin = data + 2 * active_first;
-                double* column = power.data() + f;
-                for (std::size_t k = 0; k < active_bins; ++k) {
-                    const double re = bin[2 * k];
-                    const double im = bin[2 * k + 1];
-                    column[k * kTileFrames] = re * re + im * im;
-                }
-            }
+        double stage[4] = {0, 0, 0, 0};
+        Clock::time_point mark = Clock::now();
+        const auto lap = [&](int index) {
+            if (!trace) return;
+            const Clock::time_point now = Clock::now();
+            stage[index] += std::chrono::duration<double>(now - mark).count();
+            mark = now;
+        };
 
-            for (std::size_t m = 0; m < mel_count; ++m) {
-                const MelBand& band = mel.bands[m];
-                for (std::size_t f = 0; f < kTileFrames; ++f) acc[f] = 0.0;
-                const double* weights = mel.values.data() + band.offset;
-                for (std::size_t k = band.first; k < band.end; ++k) {
-                    const double weight = weights[k - band.first];
-                    const double* row =
-                        power.data() + (k - active_first) * kTileFrames;
-                    for (std::size_t f = 0; f < kTileFrames; ++f)
-                        acc[f] += row[f] * weight;
+        for (;;) {
+            const std::size_t claim =
+                next_claim.fetch_add(1, std::memory_order_relaxed);
+            if (claim >= claims) break;
+            const std::size_t tile_end =
+                std::min(tiles, (claim + 1) * kTilesPerClaim);
+            for (std::size_t tile = claim * kTilesPerClaim; tile < tile_end;
+                 ++tile) {
+                const std::size_t frame0 = tile * kTileFrames;
+                const std::size_t count =
+                    std::min(kTileFrames, n_frames - frame0);
+                for (std::size_t batch0 = 0; batch0 < count;
+                     batch0 += kFftBatch) {
+                    // Frames past the end of a partial batch repeat the last
+                    // valid frame; their results are never stored.
+                    for (std::size_t b = 0; b < kFftBatch; ++b) {
+                        const std::size_t f = std::min(batch0 + b, count - 1);
+                        const double* src = samples + (frame0 + f) * hop;
+                        double* data = buffer.data() + b * stride;
+                        for (std::size_t i = 0; i < fft_size; ++i)
+                            data[i] = src[i] * window[i];
+                    }
+                    lap(0);
+                    plan.forward(buffer.data());
+                    lap(1);
+                    const std::size_t batch_count =
+                        std::min(kFftBatch, count - batch0);
+                    for (std::size_t b = 0; b < batch_count; ++b) {
+                        const double* bin =
+                            buffer.data() + b * stride + 2 * active_first;
+                        for (std::size_t k = 0; k < active_bins; ++k) {
+                            const double re = bin[2 * k];
+                            const double im = bin[2 * k + 1];
+                            power[k] = re * re + im * im;
+                        }
+                        lap(2);
+                        const std::size_t f = batch0 + b;
+                        for (std::size_t m = 0; m < mel_count; ++m) {
+                            const MelBand& band = mel.bands[m];
+                            const double* weights =
+                                mel.values.data() + band.offset;
+                            const double* p =
+                                power.data() + (band.first - active_first);
+                            const std::size_t length = band.end - band.first;
+                            double sum = 0.0;
+                            for (std::size_t k = 0; k < length; ++k)
+                                sum += p[k] * weights[k];
+                            tile_out[m * kTileFrames + f] = sum;
+                        }
+                        lap(3);
+                    }
                 }
-                double* destination = output + m * n_frames + frame0;
-                for (std::size_t f = 0; f < count; ++f)
-                    destination[f] = acc[f];
+                for (std::size_t m = 0; m < mel_count; ++m) {
+                    const double* row = tile_out.data() + m * kTileFrames;
+                    double* destination = output + m * n_frames + frame0;
+                    for (std::size_t f = 0; f < count; ++f)
+                        destination[f] = row[f];
+                }
+                lap(3);
             }
         }
+        if (trace) {
+            worker_times[2 * worker] =
+                std::chrono::duration<double>(planned - launch).count();
+            worker_times[2 * worker + 1] =
+                std::chrono::duration<double>(Clock::now() - launch).count();
+            if (worker == 0)
+                std::fprintf(
+                    stderr,
+                    "trace w0 window %.4f fft %.4f power %.4f mel %.4f\n",
+                    stage[0], stage[1], stage[2], stage[3]);
+        }
     });
+    if (trace) {
+        double lo[2] = {1e9, 1e9}, hi[2] = {0, 0};
+        for (std::size_t w = 0; w < workers; ++w)
+            for (int i = 0; i < 2; ++i) {
+                lo[i] = std::min(lo[i], worker_times[2 * w + i]);
+                hi[i] = std::max(hi[i], worker_times[2 * w + i]);
+            }
+        std::fprintf(stderr,
+                     "trace workers %zu planned %.4f..%.4f done %.4f..%.4f\n",
+                     workers, lo[0], hi[0], lo[1], hi[1]);
+    }
 }
 #endif
 
@@ -521,6 +629,7 @@ std::vector<std::vector<double>> build_mel_filterbank(int sr, int n_fft,
 void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                             int hop_length, int n_mels, double f_min,
                             double f_max, std::vector<double>& output) {
+    StageTrace trace;
     validate_mel_parameters(sr, n_fft, n_mels, f_min, f_max);
     if (hop_length <= 0)
         throw std::invalid_argument("hop_length must be positive");
@@ -550,7 +659,9 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         input = &alias_input;
     }
     const double* input_samples = input->data();
+    trace.mark("setup");
     output.resize(output_count);
+    trace.mark("output_resize");
 
     // The periodic Hann window of length one is exactly zero.
     if (n_fft == 1) {
@@ -565,8 +676,10 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     }
 
 #if MELSPEC_MKL
+    trace.mark("window");
     compute_with_mkl(input_samples, n_frames, fft_size, hop, mel, window,
-                     requested_threads, output.data());
+                     requested_threads, output.data(), trace.enabled());
+    trace.mark("kernel");
     return;
 #endif
 

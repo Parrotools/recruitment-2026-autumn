@@ -477,3 +477,34 @@ job 117 最终 `FAILED 141:0` 的原因是末尾诊断 shell 管道的 SIGPIPE�
 - Linux 上 `HUGE_ALLOC` 默认改为 1：R3 job 121 同组三轮显示 B+HUGE_ALLOC 相对 B 的 paired ratio 为 1.25–1.38，且 read/write 阶段（`main.cpp` 中的大 vector 首次触页）同样受益；这是一个“未改 main.cpp 也能加速 main.cpp 内存分配”的手段。
 - `MKLROOT` 默认指向集群 spack 中的 oneMKL；找不到时 `MKL` 自动为 0，回退到 R2/R3 的手写 FFT。
 
+### R4 测量环境与一个测量陷阱
+
+- 节点：hepnode2，`sbatch -N1 -c 64 --exclusive`，GCC 15.2，所有计时都在计算节点上跑；`validate.py` 与 `src/main.cpp` 均未修改。
+- **陷阱**：第一次 MKL 验证（job 139）中我把 `TMPDIR` 设到了 `/home` 下的工作目录，`validate.py` 的 `tempfile.mkstemp()` 于是把 200–400 MB 输出写到了共享文件系统上，default 测得 0.58–0.61 s；同一程序写 tmpfs `/tmp` 时为 ~0.38 s。阶段计时也印证了这一点：`floatcast+write` 在 `/home` 上约 0.37 s，在 `/tmp` 上约 0.14 s。官方 validate 默认使用 `/tmp`，因此之后所有 R4 测量都让输出落在 `/tmp`。R3 job 117 的 B 行 write 阶段偏慢（0.45–0.49 s）很可能也有同样的原因。
+
+### R4 基线：同一份 R2 B+HUGE 代码，从 8 核换到 64 核（job 137，validate 5 次取最小）
+
+| Case | 8 线程 (s) | 64 线程 (s) |
+|---|---:|---:|
+| default | 0.887 | 0.380 |
+| small_mels | 0.758 | 0.232 |
+| large_fft | 1.609 | 0.467 |
+| narrow_band | 1.530 | 0.466 |
+
+只改线程数就有 2.3–3.4 倍提升，但远小于 8 倍：在 64 核时，`main.cpp` 中不可修改的串行读写已经与 compute 同一量级。
+
+### R4 profile：64 核时时间去了哪里
+
+阶段计时（job 145，default，输出写 `/tmp`）：read+normalize 0.07 s、compute 0.16 s（其中 `output.resize()` 单线程清零 394 MB 占 0.027 s）、floatcast+write 0.14 s，进程总墙钟时间约 0.38 s。也就是说，即便把 compute 降为 0，默认 case 也只能到约 0.24 s；剩下可优化的主要是 kernel 本身。
+
+`MELSPEC_TRACE=1` 打开的 worker 内部计时（job 147/148）：
+
+| 观测 | 数据 | 结论 |
+|---|---|---|
+| 线程启动 + MKL descriptor commit | 64 个 worker 在 ≤16 ms 内全部开始计算 | 不是瓶颈 |
+| worker 完成时间 | default 0.083–0.145 s，large_fft 0.19–0.32 s | 连续静态分块**负载不均**，最慢的 worker 比最快的慢 50% 以上 |
+| 线程扩展（default compute） | 1/8/16/32/64 线程：5.00/0.66/0.35/0.20/0.13–0.16 s | 32 线程前接近线性，64 线程时开始受频率、带宽和不均衡影响 |
+| 单线程分阶段（default，每帧） | 加窗 3.8 µs、FFT 14.6 µs、power 3.8 µs、Mel 3.5 µs | FFT 占约 57%；power 的 `[bin][frame]` 转置写每次都落在新 cache line，代价接近加窗 |
+| 单线程分阶段（narrow_band，每帧） | 加窗 7.6 µs、FFT 36.3 µs、power 3.2 µs、Mel 2.5 µs | 16384 点 FFT 的工作集变大，FFT 占约 73% |
+| MKL 与手写 FFT（单线程 default compute） | 4.94 s 与 5.06 s | 在这台机器上，手写跨帧 AVX2 radix-2 与 MKL 单帧 r2c 基本持平；单换 FFT 库不是突破口 |
+
