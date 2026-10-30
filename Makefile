@@ -4,16 +4,26 @@ CXXFLAGS ?= -std=c++17 -Wall -Wextra -O3
 LDFLAGS ?=
 LDLIBS ?=
 
+UNAME_S := $(shell uname -s)
 SCALAR ?= 0
+ifeq ($(UNAME_S),Linux)
+HUGE_ALLOC ?= 1
+else
 HUGE_ALLOC ?= 0
+endif
 FUSED_FFT ?= 0
 AVX512 ?= 0
-ARCH_FLAGS ?=
+ARCH_FLAGS ?= -march=native
+
+# Intel oneMKL (DFTI) for the per-frame real FFT. Defaults to the cluster's
+# spack installation and falls back to the built-in FFT when it is missing.
+MKLROOT ?= /data/spack/opt/spack/linux-ubuntu24.04-icelake/gcc-15.2.0/intel-oneapi-mkl-2026.0.0-hfx23rl27uqjzo3hhabps7y6tbsaujgf/mkl/2026.0
+MKL ?= $(if $(wildcard $(MKLROOT)/include/mkl_dfti.h),1,0)
 CLANG_FORMAT ?= clang-format
 MELSPEC_TEST_TMPDIR ?= $(abspath $(CURDIR)/../melspec-optimization-artifacts)
 ROUND2_BUILD_DIR ?= $(abspath $(CURDIR)/../melspec-optimization-20261029/round2/build)
 
-ifneq ($(filter-out 0 1,$(SCALAR) $(HUGE_ALLOC) $(FUSED_FFT) $(AVX512)),)
+ifneq ($(filter-out 0 1,$(SCALAR) $(HUGE_ALLOC) $(FUSED_FFT) $(AVX512) $(MKL)),)
 $(error SCALAR, HUGE_ALLOC, FUSED_FFT, and AVX512 must be 0 or 1)
 endif
 
@@ -54,6 +64,16 @@ endif
 MELSPEC_COMPILE_FLAGS = $(CXXFLAGS) $(ARCH_FLAGS) -pthread
 LDLIBS += -pthread
 
+MELSPEC_DEFINES += -DMELSPEC_MKL=$(MKL)
+ifeq ($(MKL),1)
+CPPFLAGS += -I$(MKLROOT)/include
+# Static sequential MKL: no runtime library path needed and no extra MKL
+# threads; parallelism comes from our own frame partitioning.
+LDLIBS += -Wl,--start-group $(MKLROOT)/lib/libmkl_intel_lp64.a \
+	$(MKLROOT)/lib/libmkl_sequential.a $(MKLROOT)/lib/libmkl_core.a \
+	-Wl,--end-group -lm -ldl
+endif
+
 ifeq ($(AVX512),1)
 ifeq ($(SCALAR),0)
 ifeq ($(findstring -mavx512f,$(CXXFLAGS) $(ARCH_FLAGS)),)
@@ -63,7 +83,7 @@ endif
 endif
 
 ifeq ($(HUGE_ALLOC),1)
-ifneq ($(shell uname -s),Linux)
+ifneq ($(UNAME_S),Linux)
 $(error HUGE_ALLOC=1 is supported only on Linux)
 endif
 endif

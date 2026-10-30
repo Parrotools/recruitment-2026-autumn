@@ -27,6 +27,14 @@
 #define MELSPEC_AVX512 0
 #endif
 
+#ifndef MELSPEC_MKL
+#define MELSPEC_MKL 0
+#endif
+
+#if MELSPEC_MKL
+#include <mkl_dfti.h>
+#endif
+
 #if MELSPEC_AVX512 && !MELSPEC_SCALAR && !defined(__AVX512F__)
 #error "MELSPEC_AVX512=1 requires AVX-512F compiler support (for example -mavx512f)"
 #endif
@@ -310,6 +318,156 @@ std::pair<std::size_t, std::size_t> group_range(std::size_t groups,
     return {first, first + count};
 }
 
+// Runs body(worker) on `workers` threads (worker 0 on the caller) and rethrows
+// the first failure after every started thread has been joined.
+template <typename Body>
+void run_workers(std::size_t workers, Body&& body) {
+    if (workers == 1) {
+        body(std::size_t{0});
+        return;
+    }
+    std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> worker_errors(workers);
+    threads.reserve(workers - 1);
+    std::exception_ptr launch_error;
+    for (std::size_t worker = 1; worker < workers; ++worker) {
+        try {
+            threads.emplace_back([&, worker] {
+                try {
+                    body(worker);
+                } catch (...) {
+                    worker_errors[worker] = std::current_exception();
+                }
+            });
+        } catch (...) {
+            launch_error = std::current_exception();
+            break;
+        }
+    }
+    std::exception_ptr main_error;
+    if (!launch_error) {
+        try {
+            body(std::size_t{0});
+        } catch (...) {
+            main_error = std::current_exception();
+        }
+    }
+    for (std::thread& thread : threads) thread.join();
+
+    if (launch_error) std::rethrow_exception(launch_error);
+    if (main_error) std::rethrow_exception(main_error);
+    for (const std::exception_ptr& error : worker_errors) {
+        if (error) std::rethrow_exception(error);
+    }
+}
+
+#if MELSPEC_MKL
+class DftiPlan {
+   public:
+    explicit DftiPlan(std::size_t n) {
+        MKL_LONG status = DftiCreateDescriptor(&handle_, DFTI_DOUBLE, DFTI_REAL,
+                                               1, static_cast<MKL_LONG>(n));
+        if (status == 0)
+            status = DftiSetValue(handle_, DFTI_CONJUGATE_EVEN_STORAGE,
+                                  DFTI_COMPLEX_COMPLEX);
+        if (status == 0) status = DftiSetValue(handle_, DFTI_THREAD_LIMIT, 1);
+        if (status == 0) status = DftiCommitDescriptor(handle_);
+        if (status != 0) {
+            if (handle_ != nullptr) DftiFreeDescriptor(&handle_);
+            throw std::runtime_error("MKL DFTI descriptor setup failed");
+        }
+    }
+    ~DftiPlan() {
+        DftiFreeDescriptor(&handle_);
+    }
+    DftiPlan(const DftiPlan&) = delete;
+    DftiPlan& operator=(const DftiPlan&) = delete;
+
+    // In-place real-to-complex transform: `data` holds n reals on entry and
+    // n/2+1 interleaved complex values on exit.
+    void forward(double* data) const {
+        if (DftiComputeForward(handle_, data) != 0)
+            throw std::runtime_error("MKL DFTI forward transform failed");
+    }
+
+   private:
+    DFTI_DESCRIPTOR_HANDLE handle_ = nullptr;
+};
+
+// Frames per tile. The power tile is stored bin-major so the Mel accumulation
+// runs across the frames of a tile and each Mel row is written contiguously.
+constexpr std::size_t kTileFrames = 16;
+
+void compute_with_mkl(const double* samples, std::size_t n_frames,
+                      std::size_t fft_size, std::size_t hop,
+                      const MelWeights& mel, const std::vector<double>& window,
+                      std::size_t requested_threads, double* output) {
+    const std::size_t n_bins = fft_size / 2 + 1;
+    std::size_t active_first = n_bins;
+    std::size_t active_end = 0;
+    for (const MelBand& band : mel.bands) {
+        if (band.first == band.end) continue;
+        active_first = std::min(active_first, band.first);
+        active_end = std::max(active_end, band.end);
+    }
+    const std::size_t mel_count = mel.bands.size();
+    if (active_end <= active_first) {
+        std::fill(output, output + mel_count * n_frames, 0.0);
+        return;
+    }
+    const std::size_t active_bins = active_end - active_first;
+
+    const std::size_t tiles =
+        n_frames / kTileFrames + (n_frames % kTileFrames != 0 ? 1 : 0);
+    const std::size_t workers = worker_count_for(tiles, requested_threads);
+
+    run_workers(workers, [&](std::size_t worker) {
+        const auto range = group_range(tiles, worker, workers);
+        if (range.first == range.second) return;
+        const DftiPlan plan(fft_size);
+        std::vector<double> buffer(2 * n_bins);
+        std::vector<double> power(active_bins * kTileFrames);
+        alignas(64) double acc[kTileFrames];
+
+        for (std::size_t tile = range.first; tile < range.second; ++tile) {
+            const std::size_t frame0 = tile * kTileFrames;
+            const std::size_t count =
+                std::min(kTileFrames, n_frames - frame0);
+            for (std::size_t f = 0; f < count; ++f) {
+                const double* src = samples + (frame0 + f) * hop;
+                double* data = buffer.data();
+                for (std::size_t i = 0; i < fft_size; ++i)
+                    data[i] = src[i] * window[i];
+                plan.forward(data);
+                const double* bin = data + 2 * active_first;
+                double* column = power.data() + f;
+                for (std::size_t k = 0; k < active_bins; ++k) {
+                    const double re = bin[2 * k];
+                    const double im = bin[2 * k + 1];
+                    column[k * kTileFrames] = re * re + im * im;
+                }
+            }
+
+            for (std::size_t m = 0; m < mel_count; ++m) {
+                const MelBand& band = mel.bands[m];
+                for (std::size_t f = 0; f < kTileFrames; ++f) acc[f] = 0.0;
+                const double* weights = mel.values.data() + band.offset;
+                for (std::size_t k = band.first; k < band.end; ++k) {
+                    const double weight = weights[k - band.first];
+                    const double* row =
+                        power.data() + (k - active_first) * kTileFrames;
+                    for (std::size_t f = 0; f < kTileFrames; ++f)
+                        acc[f] += row[f] * weight;
+                }
+                double* destination = output + m * n_frames + frame0;
+                for (std::size_t f = 0; f < count; ++f)
+                    destination[f] = acc[f];
+            }
+        }
+    });
+}
+#endif
+
 }  // namespace
 
 // HTK mel scale conversions.
@@ -405,6 +563,12 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         window[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * static_cast<double>(i) /
                                           static_cast<double>(fft_size)));
     }
+
+#if MELSPEC_MKL
+    compute_with_mkl(input_samples, n_frames, fft_size, hop, mel, window,
+                     requested_threads, output.data());
+    return;
+#endif
 
     const std::size_t half_fft = fft_size / 2;
     const std::size_t n_bins = half_fft + 1;
@@ -677,45 +841,8 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         }
     };
 
-    if (workers == 1) {
-        process_block(0, group_count);
-        return;
-    }
-
-    std::vector<std::thread> threads;
-    std::vector<std::exception_ptr> worker_errors(workers);
-    threads.reserve(workers - 1);
-    std::exception_ptr launch_error;
-    for (std::size_t worker = 1; worker < workers; ++worker) {
+    run_workers(workers, [&](std::size_t worker) {
         const auto range = group_range(group_count, worker, workers);
-        try {
-            threads.emplace_back([&, worker, range] {
-                try {
-                    process_block(range.first, range.second);
-                } catch (...) {
-                    worker_errors[worker] = std::current_exception();
-                }
-            });
-        } catch (...) {
-            launch_error = std::current_exception();
-            break;
-        }
-    }
-
-    std::exception_ptr main_error;
-    if (!launch_error) {
-        const auto range = group_range(group_count, 0, workers);
-        try {
-            process_block(range.first, range.second);
-        } catch (...) {
-            main_error = std::current_exception();
-        }
-    }
-    for (std::thread& thread : threads) thread.join();
-
-    if (launch_error) std::rethrow_exception(launch_error);
-    if (main_error) std::rethrow_exception(main_error);
-    for (const std::exception_ptr& error : worker_errors) {
-        if (error) std::rethrow_exception(error);
-    }
+        process_block(range.first, range.second);
+    });
 }

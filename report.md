@@ -455,3 +455,25 @@ validator 的四组 `4/4 PASS` 和 B_huge 的 hash 已在上方记录；`validat
 - Round3：本地 `/Users/zigeqiao/workspace/melspec-optimization-20261029/round3/`，远端 `/home/qzg/workspace/melspec-optimization-20261029/round3/`。关键文件为 `baseline/README.md`、`results/compute-phases-baseline-job117.json`、`results/profile-overhead-job117.json`、`results/diagnostic-summary-job117.txt`、`results/cli-baseline-8-job118.json`、`results/candidate-build-manifest-job117.txt`、`results/objdump-{B,F,V,FV}-job117.txt` 和 `candidate-source/`。
 
 job 117 最终 `FAILED 141:0` 的原因是末尾诊断 shell 管道的 SIGPIPE；保留的独立 JSON、单测/build 日志和反汇编可用于核对具体步骤，但整体作业不能记为 PASS。job 121 的 Slurm 编号依据实施阶段提交记录及 Main 只读 `sacct` 结果，不来自 `cli-baseline-8-job118.json` 的 JSON 字段；该 JSON 文件名只保留了其 work-directory 标签。profile 百分比来自低频 worker 阶段计时，`objdump` 来自静态汇编；二者都不应描述为 perf CPU profile 或单项加速实测。
+
+## 第四轮：用满整机 64 核 + MKL FFT（进行中）
+
+### 动机：前三轮遗漏的两个大方向
+
+1. **核数**：前三轮的所有正式测量都固定 8 核（`taskset -c 0-7` / Slurm `-c 8`）。heptagon 计算节点 hepnode1–3 实际为 2× Xeon Gold 6338（64 物理核、无超线程、4 个 NUMA 节点、L2 1.25 MiB/核、支持 AVX-512），`/tmp` 是 tmpfs。题目允许使用整机资源，compute 阶段又是按帧完全独立的并行任务，扩展到 64 核是收益最大的一步。
+2. **FFT 本身**：R3 采样显示 FFT 占 worker kernel 时间 63–68%。手写实现是跨帧 SIMD 的 radix-2：每一级都要把整块（`n_fft/2` 个复数 × lane 数 × 16 B，default 为 256–512 KiB）从 L2 完整扫一遍，共 log2(n_fft/2) 级，带宽受限；再加 bit-reversal 的随机写。题目明确允许 FFTW/cuFFT 等科学计算库，集群 spack 里没有 FFTW，但有 Intel oneMKL 2026.0（DFTI 接口），在 Intel CPU 上有针对 AVX-512 的混合基、cache-oblivious 实现。
+
+### 新的计算结构（`MKL=1`，默认在检测到 MKL 时启用）
+
+- 每个 worker 一个 MKL DFTI descriptor：`DFTI_DOUBLE`、`DFTI_REAL`、原地、`DFTI_COMPLEX_COMPLEX` 存储、`THREAD_LIMIT=1`；链接**静态** `mkl_sequential`，不引入 MKL 自己的线程池，也不需要运行时 `LD_LIBRARY_PATH`。
+- 帧按 16 帧一个 tile 连续分给 worker。tile 内逐帧：加窗拷贝到 `n_fft+2` 的缓冲 → 原地 r2c → 只对 Mel 实际覆盖的 bin 区间 `[active_first, active_end)` 求 `|X|²`，并以 `[bin][frame]` 的转置布局写入 power tile。
+- Mel 累加对一个 tile 的 16 帧做向量化（每个 bin 的 power 行是 16 个连续 double，编译器生成 AVX-512 FMA），每个滤波器内仍按 bin 升序求和，数学上与原实现逐项一致；结果行连续写入 `output[m * n_frames + frame0 ...]`。
+- 全程保持 double 精度，输出仍由未改动的 `main.cpp` 转成 float32。
+- 线程启动/异常传播抽成 `run_workers()`，手写 FFT 路径（`MKL=0`）保留为回退，并复用同一函数。
+
+### 构建默认值变化
+
+- `ARCH_FLAGS ?= -march=native`（构建在 Slurm 计算节点上进行，与运行节点同型号）。
+- Linux 上 `HUGE_ALLOC` 默认改为 1：R3 job 121 同组三轮显示 B+HUGE_ALLOC 相对 B 的 paired ratio 为 1.25–1.38，且 read/write 阶段（`main.cpp` 中的大 vector 首次触页）同样受益；这是一个“未改 main.cpp 也能加速 main.cpp 内存分配”的手段。
+- `MKLROOT` 默认指向集群 spack 中的 oneMKL；找不到时 `MKL` 自动为 0，回退到 R2/R3 的手写 FFT。
+
