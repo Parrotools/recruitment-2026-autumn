@@ -473,7 +473,7 @@ constexpr std::size_t kTileFrames = 16;
 constexpr std::size_t kFftBatch = MELSPEC_MKL_BATCH;
 static_assert(kTileFrames % kFftBatch == 0, "batch must divide the tile");
 // Frames whose Mel sums are accumulated together (independent FMA chains).
-constexpr std::size_t kMelGroup = 4;
+constexpr std::size_t kMelGroup = 4;  // 8 measured no faster
 static_assert(kTileFrames % kMelGroup == 0, "groups must tile a tile");
 // Tiles handed out per scheduling step.
 constexpr std::size_t kTilesPerClaim = 2;
@@ -557,6 +557,9 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
     using Clock = std::chrono::steady_clock;
     const Clock::time_point launch = Clock::now();
     std::vector<double> worker_times(trace ? 3 * workers : 0);
+    // Per-worker seconds in each traced stage (see `lap`).
+    constexpr int kStages = 6;
+    std::vector<double> stage_times(trace ? kStages * workers : 0);
 
     enum : int { kPending, kReady, kFailed };
     std::atomic<int> output_state{kPending};
@@ -632,7 +635,8 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
             kFreqWindow<Real> ? kMelGroup * active_bins : 0);
         std::vector<double> tile_out(mel_count * kTileFrames);
 
-        double stage[4] = {0, 0, 0, 0};
+        // window, fft, power, mel, tile store or stash, claims and flushes
+        double stage[kStages] = {0, 0, 0, 0, 0, 0};
         Clock::time_point mark = Clock::now();
         const auto lap = [&](int index) {
             if (!trace) return;
@@ -671,29 +675,24 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 const MelBand& band = mel.bands[m];
                 const double* weights = mel.values.data() + band.offset;
                 const std::size_t offset = band.first - active_first;
-                const Real* p0 = row[0] + offset;
-                const Real* p1 = row[1] + offset;
-                const Real* p2 = row[2] + offset;
-                const Real* p3 = row[3] + offset;
                 const std::size_t length = band.end - band.first;
-                double s0 = 0.0, s1 = 0.0, s2 = 0.0, s3 = 0.0;
+                double sums[kMelGroup] = {};
                 for (std::size_t k = 0; k < length; ++k) {
                     const double w = weights[k];
-                    s0 += p0[k] * w;
-                    s1 += p1[k] * w;
-                    s2 += p2[k] * w;
-                    s3 += p3[k] * w;
+                    for (std::size_t g = 0; g < kMelGroup; ++g)
+                        sums[g] += row[g][offset + k] * w;
                 }
                 double* out = tile_out.data() + m * kTileFrames + f0;
-                const double sums[kMelGroup] = {s0, s1, s2, s3};
                 for (std::size_t g = 0; g < group; ++g) out[g] = sums[g];
             }
         };
 
         for (;;) {
             if (!ready && !become_ready(false)) return;
+            lap(4);  // flushing the stash is storing tiles
             const std::size_t claim =
                 next_claim.fetch_add(1, std::memory_order_relaxed);
+            lap(5);
             if (claim >= claims) break;
             const std::size_t tile_end =
                 std::min(tiles, (claim + 1) * kTilesPerClaim);
@@ -754,21 +753,19 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                     stash.emplace_back(tile, tile_out);
                     ++stashed_tiles;
                 }
-                lap(3);
+                lap(4);
             }
         }
         if (!ready && !become_ready(true)) return;
+        lap(5);
         if (trace) {
+            for (int i = 0; i < kStages; ++i)
+                stage_times[kStages * worker + i] = stage[i];
             worker_times[3 * worker] =
                 std::chrono::duration<double>(planned - launch).count();
             worker_times[3 * worker + 1] =
                 std::chrono::duration<double>(Clock::now() - launch).count();
             worker_times[3 * worker + 2] = static_cast<double>(stashed_tiles);
-            if (worker == 0)
-                std::fprintf(
-                    stderr,
-                    "trace w0 window %.4f fft %.4f power %.4f mel %.4f\n",
-                    stage[0], stage[1], stage[2], stage[3]);
         }
     });
     if (trace) {
@@ -782,6 +779,17 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                      "trace workers %zu planned %.4f..%.4f done %.4f..%.4f "
                      "stashed %.0f..%.0f\n",
                      workers, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+        double total[kStages] = {0, 0, 0, 0, 0, 0};
+        for (std::size_t w = 0; w < workers; ++w)
+            for (int i = 0; i < kStages; ++i)
+                total[i] += stage_times[kStages * w + i];
+        // Summed over workers, as seconds per worker on average.
+        const double n = static_cast<double>(workers);
+        std::fprintf(stderr,
+                     "trace avg window %.4f fft %.4f power %.4f mel %.4f "
+                     "store %.4f sched %.4f\n",
+                     total[0] / n, total[1] / n, total[2] / n, total[3] / n,
+                     total[4] / n, total[5] / n);
     }
 }
 #endif
