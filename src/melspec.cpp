@@ -39,8 +39,19 @@
 #include <mkl_dfti.h>
 #endif
 
+#if defined(__linux__) && defined(MELSPEC_HUGE_ALLOC) && MELSPEC_HUGE_ALLOC
+// Defined in large_alloc.cpp; weak so builds without the allocator (such as
+// the unit test) link, with the address then being null.
+__attribute__((weak)) void melspec_reserve_allocation(
+    std::size_t bytes) noexcept;
+#define MELSPEC_HAS_RESERVE 1
+#else
+#define MELSPEC_HAS_RESERVE 0
+#endif
+
 #if MELSPEC_AVX512 && !MELSPEC_SCALAR && !defined(__AVX512F__)
-#error "MELSPEC_AVX512=1 requires AVX-512F compiler support (for example -mavx512f)"
+#error \
+    "MELSPEC_AVX512=1 requires AVX-512F compiler support (for example -mavx512f)"
 #endif
 
 #if MELSPEC_SCALAR
@@ -503,6 +514,16 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 throw;
             }
             output_state.store(kReady, std::memory_order_release);
+#if MELSPEC_HAS_RESERVE
+            // main.cpp's write_output next allocates a float copy of the
+            // output. Fault its pages in now, while the other workers keep
+            // the cores busy, instead of on the serial write path; worker 0
+            // is the calling thread, so they are also NUMA-local to the
+            // conversion loop there. Dynamic tile claiming absorbs the delay.
+            if (melspec_reserve_allocation != nullptr)
+                melspec_reserve_allocation(mel_count * n_frames *
+                                           sizeof(float));
+#endif
         }
         bool ready = worker == 0;
         std::vector<std::pair<std::size_t, std::vector<double>>> stash;
@@ -513,8 +534,7 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
             for (std::size_t m = 0; m < mel_count; ++m) {
                 const double* row = values + m * kTileFrames;
                 double* destination = output + m * n_frames + frame0;
-                for (std::size_t f = 0; f < count; ++f)
-                    destination[f] = row[f];
+                for (std::size_t f = 0; f < count; ++f) destination[f] = row[f];
             }
         };
         // Returns false if the output could not be prepared.
@@ -570,7 +590,8 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                         const double* src = samples + (frame0 + f) * hop;
                         Real* data = buffer.data() + b * stride;
                         for (std::size_t i = 0; i < fft_size; ++i)
-                            data[i] = static_cast<Real>(src[i]) * window_real[i];
+                            data[i] =
+                                static_cast<Real>(src[i]) * window_real[i];
                     }
                     lap(0);
                     plan.forward(buffer.data());
@@ -835,8 +856,7 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
             for (; len <= half_fft / 2; len *= 4) {
                 const std::size_t q = len / 2;
                 const std::size_t two_len = 2 * len;
-                for (std::size_t base = 0; base < half_fft;
-                     base += two_len) {
+                for (std::size_t base = 0; base < half_fft; base += two_len) {
                     for (std::size_t j = 0; j < q; ++j) {
                         const std::size_t a = base + j;
                         const std::size_t b = a + q;
@@ -883,18 +903,14 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                             twiddles.real[second_twiddle_b];
                         const double second_b_wi =
                             twiddles.imag[second_twiddle_b];
-                        const FrameVec v_real =
-                            upper_c_real * second_a_wr -
-                            upper_c_imag * second_a_wi;
-                        const FrameVec v_imag =
-                            upper_c_real * second_a_wi +
-                            upper_c_imag * second_a_wr;
-                        const FrameVec z_real =
-                            upper_d_real * second_b_wr -
-                            upper_d_imag * second_b_wi;
-                        const FrameVec z_imag =
-                            upper_d_real * second_b_wi +
-                            upper_d_imag * second_b_wr;
+                        const FrameVec v_real = upper_c_real * second_a_wr -
+                                                upper_c_imag * second_a_wi;
+                        const FrameVec v_imag = upper_c_real * second_a_wi +
+                                                upper_c_imag * second_a_wr;
+                        const FrameVec z_real = upper_d_real * second_b_wr -
+                                                upper_d_imag * second_b_wi;
+                        const FrameVec z_imag = upper_d_real * second_b_wi +
+                                                upper_d_imag * second_b_wr;
 
                         real[a] = upper_a_real + v_real;
                         imag[a] = upper_a_imag + v_imag;

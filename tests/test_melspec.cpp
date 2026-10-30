@@ -177,8 +177,8 @@ void check_mel_cases() {
     std::uniform_real_distribution<double> distribution(-1.0, 1.0);
     const int sr = 32;
     for (int n_fft : {1, 2, 4, 8, 16, 32, 64, 128}) {
-        for (std::size_t n_frames : {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u,
-                                     10u, 15u, 16u, 17u, 18u}) {
+        for (std::size_t n_frames :
+             {1u, 2u, 3u, 4u, 5u, 6u, 7u, 8u, 9u, 10u, 15u, 16u, 17u, 18u}) {
             for (int pattern = 0; pattern < 3; ++pattern) {
                 const int hop = std::max(1, n_fft / 2);
                 const int n_mels = pattern == 0 ? 3 : (n_fft < 16 ? 8 : 12);

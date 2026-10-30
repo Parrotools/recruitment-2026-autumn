@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 
 #ifndef MELSPEC_HUGE_ALLOC
@@ -134,7 +135,8 @@ void touch_pages(unsigned char* base, std::size_t page_size,
     }
 }
 
-void touch_mapping(unsigned char* base, std::size_t usable_size) noexcept {
+void touch_mapping(unsigned char* base, std::size_t usable_size,
+                   std::size_t max_threads) noexcept {
     const long system_page_size = sysconf(_SC_PAGESIZE);
     // Linux pages are at least 4 KiB; the conservative fallback still touches
     // every page if sysconf is unexpectedly unavailable.
@@ -145,7 +147,7 @@ void touch_mapping(unsigned char* base, std::size_t usable_size) noexcept {
     const std::size_t workers = std::max<std::size_t>(
         1, std::min<std::size_t>({allocator_usable_cpus(),
                                   allocator_thread_limit(), page_count,
-                                  std::size_t{MELSPEC_TOUCH_THREADS}}));
+                                  max_threads}));
     if (workers == 1) {
         touch_pages(base, page_size, 0, page_count);
         return;
@@ -181,7 +183,8 @@ void touch_mapping(unsigned char* base, std::size_t usable_size) noexcept {
     }
 }
 
-void* mapped_block(std::size_t requested) noexcept {
+void* mapped_block(std::size_t requested,
+                   std::size_t touch_threads = MELSPEC_TOUCH_THREADS) noexcept {
     const std::size_t payload = std::max<std::size_t>(requested, 1);
     constexpr std::size_t kHeaderSize = sizeof(AllocationHeader);
     if (payload > std::numeric_limits<std::size_t>::max() - kHeaderSize) {
@@ -216,7 +219,7 @@ void* mapped_block(std::size_t requested) noexcept {
         ~(static_cast<std::uintptr_t>(kHugePageAlignment) - 1);
     auto* base = reinterpret_cast<unsigned char*>(aligned_address);
     (void)madvise(base, usable_size, MADV_HUGEPAGE);
-    touch_mapping(base, usable_size);
+    touch_mapping(base, usable_size, touch_threads);
 
     ::new (static_cast<void*>(base))
         AllocationHeader{kMappedAllocationTag, raw, mapping.size()};
@@ -225,8 +228,28 @@ void* mapped_block(std::size_t requested) noexcept {
     return user;
 }
 
+// A pre-faulted mapping parked by melspec_reserve_allocation(), handed to the
+// next big allocation it fits without wasting more than half of it.
+std::atomic<AllocationHeader*> g_reserved{nullptr};
+
+std::size_t mapped_capacity(const AllocationHeader* header) noexcept {
+    return header->mapping_size - kHugePageAlignment - sizeof(AllocationHeader);
+}
+
+void* take_reserved(std::size_t requested) noexcept {
+    AllocationHeader* header = g_reserved.load(std::memory_order_acquire);
+    if (header == nullptr) return nullptr;
+    const std::size_t capacity = mapped_capacity(header);
+    if (requested > capacity || requested < capacity / 2) return nullptr;
+    if (!g_reserved.compare_exchange_strong(header, nullptr,
+                                            std::memory_order_acq_rel))
+        return nullptr;
+    return header + 1;
+}
+
 void* allocate_once(std::size_t requested) noexcept {
     if (requested >= kBigAllocationThreshold && g_allocator_recursion == 0) {
+        if (void* reserved = take_reserved(requested)) return reserved;
         RecursionGuard guard;
         if (void* mapped = mapped_block(requested)) return mapped;
     }
@@ -234,6 +257,24 @@ void* allocate_once(std::size_t requested) noexcept {
 }
 
 }  // namespace
+
+// Maps and pre-faults, on the calling thread only, a block for a big
+// allocation the caller knows is coming (see compute_melspectrogram), so that
+// allocation later costs neither page faults nor kernel zeroing. Replaces an
+// earlier unused reservation.
+void melspec_reserve_allocation(std::size_t bytes) noexcept {
+    if (bytes < kBigAllocationThreshold || g_allocator_recursion != 0) return;
+    void* user;
+    {
+        RecursionGuard guard;
+        user = mapped_block(bytes, 1);
+    }
+    if (user == nullptr) return;
+    auto* header = static_cast<AllocationHeader*>(user) - 1;
+    if (AllocationHeader* old =
+            g_reserved.exchange(header, std::memory_order_acq_rel))
+        (void)munmap(old->mapping_base, old->mapping_size);
+}
 
 void* operator new(std::size_t requested) {
     for (;;) {
