@@ -474,19 +474,16 @@ constexpr std::size_t kTilesPerClaim = 2;
 // with X the DFT of the unwindowed frame. Transforming straight from the
 // input samples (out of place) and applying the window here, only on the
 // bins the Mel bands read, removes the per-frame windowed copy.
-// The input samples are double, so only a double FFT can read them directly.
+// Float FFTs read a float copy of each tile's samples (see compute_with_mkl).
 template <typename Real>
-constexpr bool kFreqWindow =
-    MELSPEC_FREQ_WINDOW && kFftBatch == 1 && std::is_same<Real, double>::value;
+constexpr bool kFreqWindow = MELSPEC_FREQ_WINDOW && kFftBatch == 1;
 
 // Writes |Y[k]|^2 for the active bins of the frame at `frame` into power.
 template <typename Real, typename Lap>
-void frequency_window_power(const DftiPlan<Real>& plan, const double* frame,
+void frequency_window_power(const DftiPlan<Real>& plan, const Real* frame,
                             std::vector<Real>& spectrum, std::size_t n_bins,
                             std::size_t active_first, Real* power,
                             std::size_t count, Lap& lap) {
-    static_assert(std::is_same<Real, double>::value,
-                  "the input samples are double");
     lap(0);
     Real* x = spectrum.data() + 2;  // x[2k], x[2k+1]: Re, Im of X[k]
     plan.forward(frame, x);
@@ -619,6 +616,13 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
         // Unwindowed spectrum X[-1..n/2+1] for the frequency-domain window;
         // bin k is at spectrum[2 * (k + 1)].
         std::vector<Real> spectrum(kFreqWindow<Real> ? 2 * (n_bins + 2) : 0);
+        // A float FFT cannot read the double samples directly: each tile's
+        // sample span is converted once here (about 1/13 of converting every
+        // frame separately).
+        constexpr bool kConvertSamples =
+            kFreqWindow<Real> && !std::is_same<Real, double>::value;
+        std::vector<Real> converted(
+            kConvertSamples ? (kTileFrames - 1) * hop + fft_size : 0);
         std::vector<Real> power(active_bins);
         // Power rows of a group of frames for the frequency-window path.
         std::vector<Real> power_group(
@@ -692,13 +696,23 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 const std::size_t count =
                     std::min(kTileFrames, n_frames - frame0);
                 if constexpr (kFreqWindow<Real>) {
+                    const Real* tile_samples;
+                    if constexpr (kConvertSamples) {
+                        const double* source = samples + frame0 * hop;
+                        const std::size_t span = (count - 1) * hop + fft_size;
+                        for (std::size_t i = 0; i < span; ++i)
+                            converted[i] = static_cast<Real>(source[i]);
+                        tile_samples = converted.data();
+                    } else {
+                        tile_samples = samples + frame0 * hop;
+                    }
                     for (std::size_t f0 = 0; f0 < count; f0 += kMelGroup) {
                         const std::size_t group =
                             std::min(kMelGroup, count - f0);
                         for (std::size_t g = 0; g < group; ++g)
                             frequency_window_power(
-                                plan, samples + (frame0 + f0 + g) * hop,
-                                spectrum, n_bins, active_first,
+                                plan, tile_samples + (f0 + g) * hop, spectrum,
+                                n_bins, active_first,
                                 power_group.data() + g * active_bins,
                                 active_bins, lap);
                         mel_group(power_group.data(), f0, group);
