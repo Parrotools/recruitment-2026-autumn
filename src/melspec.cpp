@@ -779,6 +779,14 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                      "trace workers %zu planned %.4f..%.4f done %.4f..%.4f "
                      "stashed %.0f..%.0f\n",
                      workers, lo[0], hi[0], lo[1], hi[1], lo[2], hi[2]);
+        double planned_sum = 0, done_sum = 0;
+        for (std::size_t w = 0; w < workers; ++w) {
+            planned_sum += worker_times[3 * w];
+            done_sum += worker_times[3 * w + 1];
+        }
+        std::fprintf(stderr, "trace mean planned %.4f done %.4f\n",
+                     planned_sum / static_cast<double>(workers),
+                     done_sum / static_cast<double>(workers));
         double total[kStages] = {0, 0, 0, 0, 0, 0};
         for (std::size_t w = 0; w < workers; ++w)
             for (int i = 0; i < kStages; ++i)
