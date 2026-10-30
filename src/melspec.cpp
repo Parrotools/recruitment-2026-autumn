@@ -346,16 +346,6 @@ void fft_inplace(std::vector<std::complex<double>>& values,
     }
 }
 
-std::pair<std::size_t, std::size_t> group_range(std::size_t groups,
-                                                std::size_t worker,
-                                                std::size_t workers) {
-    const std::size_t base = groups / workers;
-    const std::size_t extra = groups % workers;
-    const std::size_t first = base * worker + std::min(worker, extra);
-    const std::size_t count = base + (worker < extra ? 1 : 0);
-    return {first, first + count};
-}
-
 // Runs body(worker) on `workers` threads (worker 0 on the caller) and rethrows
 // the first failure after every started thread has been joined.
 template <typename Body>
@@ -910,11 +900,9 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     }
 #endif
 
-    output.resize(output_count);
-    trace.mark("output_resize");
-
     // The periodic Hann window of length one is exactly zero.
     if (n_fft == 1) {
+        output.resize(output_count);
         std::fill(output.begin(), output.end(), 0.0);
         return;
     }
@@ -955,15 +943,21 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     const std::size_t workers =
         worker_count_for(group_count, requested_threads);
 
-    auto process_block = [&](std::size_t first_group, std::size_t end_group) {
+    const std::size_t scratch_count = half_fft * 2 + n_bins;
+    // Lane groups per scheduling step, and the frames they cover.
+    constexpr std::size_t kGroupsPerClaim = 8;
+    constexpr std::size_t kClaimFrames = kGroupsPerClaim * kFrameLanes;
+    // Computes the frames of groups [first_group, end_group) into `tile`,
+    // laid out [mel][frame - first frame] with a row stride of kClaimFrames.
+    auto process_block = [&](std::size_t first_group, std::size_t end_group,
+                             std::vector<FrameVec>& scratch,
+                             std::vector<double>& tile) {
         const std::size_t begin =
             first_group *
             kFrameLanes;  // first_group is strictly before the last group
         const std::size_t end =
             end_group == group_count ? n_frames : end_group * kFrameLanes;
 
-        const std::size_t scratch_count = half_fft * 2 + n_bins;
-        std::vector<FrameVec> scratch(scratch_count);
         FrameVec* real = scratch.data();
         FrameVec* imag = real + half_fft;
         FrameVec* power = imag + half_fft;
@@ -1174,9 +1168,9 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                 for (std::size_t k = band.first; k < band.end; ++k) {
                     acc += power[k] * mel.values[band.offset + k - band.first];
                 }
-                double* destination = output.data() +
-                                      static_cast<std::size_t>(m) * n_frames +
-                                      frame;
+                double* destination =
+                    tile.data() + static_cast<std::size_t>(m) * kClaimFrames +
+                    (frame - begin);
                 for (std::size_t lane = 0; lane < count; ++lane) {
                     destination[lane] = frame_lane(acc, lane);
                 }
@@ -1185,8 +1179,69 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         }
     };
 
+    // Workers claim chunks of lane groups from a shared counter rather than
+    // one contiguous range each: a static split left the slowest of 64
+    // workers more than 50% behind the fastest (see report, round 4). As in
+    // the MKL path, worker 0 sizes (zero-fills) the output while the others
+    // already compute, keeping finished tiles in a private stash until the
+    // output is published.
+    const std::size_t claims = group_count / kGroupsPerClaim +
+                               (group_count % kGroupsPerClaim != 0 ? 1 : 0);
+    std::atomic<std::size_t> next_claim{0};
+    enum : int { kPending, kReady, kFailed };
+    std::atomic<int> output_state{kPending};
+    double* output_data = nullptr;  // published by output_state
     run_workers(workers, [&](std::size_t worker) {
-        const auto range = group_range(group_count, worker, workers);
-        process_block(range.first, range.second);
+        if (worker == 0) {
+            try {
+                output.resize(output_count);
+                output_data = output.data();
+            } catch (...) {
+                output_state.store(kFailed, std::memory_order_release);
+                throw;
+            }
+            output_state.store(kReady, std::memory_order_release);
+        }
+        bool ready = worker == 0;
+        std::vector<FrameVec> scratch(scratch_count);
+        std::vector<double> tile(mel_count * kClaimFrames);
+        std::vector<std::pair<std::size_t, std::vector<double>>> stash;
+        const auto store = [&](std::size_t claim, const double* values) {
+            const std::size_t first = claim * kClaimFrames;
+            const std::size_t count = std::min(kClaimFrames, n_frames - first);
+            for (std::size_t m = 0; m < mel_count; ++m)
+                std::copy(values + m * kClaimFrames,
+                          values + m * kClaimFrames + count,
+                          output_data + m * n_frames + first);
+        };
+        // Returns false if the output could not be prepared.
+        const auto become_ready = [&](bool wait) {
+            int state = output_state.load(std::memory_order_acquire);
+            while (wait && state == kPending) {
+                std::this_thread::yield();
+                state = output_state.load(std::memory_order_acquire);
+            }
+            if (state == kReady) {
+                ready = true;
+                for (const auto& entry : stash)
+                    store(entry.first, entry.second.data());
+                stash.clear();
+            }
+            return state != kFailed;
+        };
+        for (;;) {
+            if (!ready && !become_ready(false)) return;
+            const std::size_t claim =
+                next_claim.fetch_add(1, std::memory_order_relaxed);
+            if (claim >= claims) break;
+            process_block(claim * kGroupsPerClaim,
+                          std::min(group_count, (claim + 1) * kGroupsPerClaim),
+                          scratch, tile);
+            if (ready)
+                store(claim, tile.data());
+            else
+                stash.emplace_back(claim, tile);
+        }
+        if (!ready) become_ready(true);
     });
 }
