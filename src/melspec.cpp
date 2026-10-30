@@ -1,17 +1,318 @@
 #include "melspec.h"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <complex>
-#include <cstring>
+#include <cstdlib>
+#include <exception>
+#include <limits>
 #include <stdexcept>
+#include <thread>
+#include <utility>
 #include <vector>
 
-// ─────────────────────────────────────────────────────────────────────────────
-// HTK mel scale
-// ─────────────────────────────────────────────────────────────────────────────
+#if defined(__linux__)
+#include <sched.h>
+#endif
 
+#ifndef MELSPEC_SCALAR
+#define MELSPEC_SCALAR 0
+#endif
+
+#ifndef MELSPEC_FUSED_FFT
+#define MELSPEC_FUSED_FFT 0
+#endif
+
+#ifndef MELSPEC_AVX512
+#define MELSPEC_AVX512 0
+#endif
+
+#if MELSPEC_AVX512 && !MELSPEC_SCALAR && !defined(__AVX512F__)
+#error "MELSPEC_AVX512=1 requires AVX-512F compiler support (for example -mavx512f)"
+#endif
+
+#if MELSPEC_SCALAR
+constexpr std::size_t kFrameLanes = 1;
+using FrameVec = double;
+static FrameVec make_frame_vec(const double* lanes) {
+    return lanes[0];
+}
+static double frame_lane(FrameVec value, std::size_t) {
+    return value;
+}
+static FrameVec zero_frame_vec() {
+    return 0.0;
+}
+#elif MELSPEC_AVX512
+constexpr std::size_t kFrameLanes = 8;
+using FrameVec = double __attribute__((vector_size(64)));
+static FrameVec make_frame_vec(const double* lanes) {
+    FrameVec result;
+    for (std::size_t i = 0; i < kFrameLanes; ++i) result[i] = lanes[i];
+    return result;
+}
+static double frame_lane(FrameVec value, std::size_t lane) {
+    return value[lane];
+}
+static FrameVec zero_frame_vec() {
+    return FrameVec{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+}
+#elif defined(__AVX2__) && (defined(__GNUC__) || defined(__clang__))
+constexpr std::size_t kFrameLanes = 4;
+using FrameVec = double __attribute__((vector_size(32)));
+static FrameVec make_frame_vec(const double* lanes) {
+    FrameVec result;
+    for (std::size_t i = 0; i < kFrameLanes; ++i) result[i] = lanes[i];
+    return result;
+}
+static double frame_lane(FrameVec value, std::size_t lane) {
+    return value[lane];
+}
+static FrameVec zero_frame_vec() {
+    return FrameVec{0.0, 0.0, 0.0, 0.0};
+}
+#elif defined(__aarch64__) && (defined(__GNUC__) || defined(__clang__))
+constexpr std::size_t kFrameLanes = 2;
+using FrameVec = double __attribute__((vector_size(16)));
+static FrameVec make_frame_vec(const double* lanes) {
+    FrameVec result;
+    for (std::size_t i = 0; i < kFrameLanes; ++i) result[i] = lanes[i];
+    return result;
+}
+static double frame_lane(FrameVec value, std::size_t lane) {
+    return value[lane];
+}
+static FrameVec zero_frame_vec() {
+    return FrameVec{0.0, 0.0};
+}
+#else
+constexpr std::size_t kFrameLanes = 1;
+using FrameVec = double;
+static FrameVec make_frame_vec(const double* lanes) {
+    return lanes[0];
+}
+static double frame_lane(FrameVec value, std::size_t) {
+    return value;
+}
+static FrameVec zero_frame_vec() {
+    return 0.0;
+}
+#endif
+
+namespace {
+
+constexpr double kPi = 3.141592653589793238462643383279502884;
+
+struct Twiddles {
+    std::vector<double> real;
+    std::vector<double> imag;
+};
+
+Twiddles make_twiddles(std::size_t n) {
+    Twiddles result{std::vector<double>(n, 0.0), std::vector<double>(n, 0.0)};
+    for (std::size_t len = 2; len <= n;) {
+        const std::size_t half = len / 2;
+        const double angle = -2.0 * kPi / static_cast<double>(len);
+        const double root_real = std::cos(angle);
+        const double root_imag = std::sin(angle);
+        double w_real = 1.0;
+        double w_imag = 0.0;
+        for (std::size_t j = 0; j < half; ++j) {
+            result.real[half + j] = w_real;
+            result.imag[half + j] = w_imag;
+            const double next_real = w_real * root_real - w_imag * root_imag;
+            w_imag = w_real * root_imag + w_imag * root_real;
+            w_real = next_real;
+        }
+        if (len == n) break;
+        len *= 2;
+    }
+    return result;
+}
+
+bool is_power_of_two(int value) {
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+void validate_mel_parameters(int sr, int n_fft, int n_mels, double f_min,
+                             double f_max) {
+    if (sr <= 0) throw std::invalid_argument("Sample rate must be positive");
+    if (!is_power_of_two(n_fft))
+        throw std::invalid_argument("n_fft must be a positive power of two");
+    if (n_mels <= 0) throw std::invalid_argument("n_mels must be positive");
+    if (!std::isfinite(f_min) || !std::isfinite(f_max) || f_min < 0.0 ||
+        !(f_min < f_max)) {
+        throw std::invalid_argument(
+            "Frequency range must be finite and satisfy 0 <= f_min < f_max");
+    }
+}
+
+std::vector<double> make_mel_points(int n_mels, double f_min, double f_max) {
+    const double mel_min = hz_to_mel(f_min);
+    const double mel_max = hz_to_mel(f_max);
+    const std::size_t point_count = static_cast<std::size_t>(n_mels) + 2;
+    std::vector<double> points(point_count);
+    for (std::size_t i = 0; i < point_count; ++i) {
+        const double mel = mel_min + static_cast<double>(i) *
+                                         (mel_max - mel_min) /
+                                         (static_cast<double>(n_mels) + 1.0);
+        points[i] = mel_to_hz(mel);
+        if (!std::isfinite(points[i]) ||
+            (i != 0 && !(points[i] > points[i - 1]))) {
+            throw std::invalid_argument(
+                "Mel points are not finite and strictly increasing");
+        }
+    }
+    return points;
+}
+
+struct MelBand {
+    std::size_t first;
+    std::size_t end;
+    std::size_t offset;
+};
+
+struct MelWeights {
+    std::size_t n_bins;
+    std::vector<MelBand> bands;
+    std::vector<double> values;
+};
+
+MelWeights make_compact_mel_weights(int sr, int n_fft, int n_mels, double f_min,
+                                    double f_max) {
+    const std::size_t n_bins = static_cast<std::size_t>(n_fft / 2) + 1;
+    std::vector<double> fft_freqs(n_bins);
+    for (std::size_t k = 0; k < n_bins; ++k) {
+        fft_freqs[k] = static_cast<double>(k) * static_cast<double>(sr) /
+                       static_cast<double>(n_fft);
+    }
+    const std::vector<double> points = make_mel_points(n_mels, f_min, f_max);
+
+    MelWeights result{n_bins, std::vector<MelBand>(n_mels), {}};
+    std::size_t total_weights = 0;
+    for (int m = 0; m < n_mels; ++m) {
+        const double f_left = points[static_cast<std::size_t>(m)];
+        const double f_right = points[static_cast<std::size_t>(m) + 2];
+        const auto first_it =
+            std::upper_bound(fft_freqs.begin(), fft_freqs.end(), f_left);
+        const auto end_it =
+            std::lower_bound(fft_freqs.begin(), fft_freqs.end(), f_right);
+        const std::size_t first =
+            static_cast<std::size_t>(first_it - fft_freqs.begin());
+        const std::size_t end =
+            static_cast<std::size_t>(end_it - fft_freqs.begin());
+        if (end < first)
+            throw std::invalid_argument("Mel filter has an invalid bin range");
+        const std::size_t count = end - first;
+        if (count > std::numeric_limits<std::size_t>::max() - total_weights)
+            throw std::length_error("Mel filter weight count overflows size_t");
+        result.bands[static_cast<std::size_t>(m)] =
+            MelBand{first, end, total_weights};
+        total_weights += count;
+    }
+
+    result.values.resize(total_weights);
+    for (int m = 0; m < n_mels; ++m) {
+        const MelBand& band = result.bands[static_cast<std::size_t>(m)];
+        if (band.first == band.end) continue;
+        const double f_left = points[static_cast<std::size_t>(m)];
+        const double f_center = points[static_cast<std::size_t>(m) + 1];
+        const double f_right = points[static_cast<std::size_t>(m) + 2];
+        const double enorm = 2.0 / (f_right - f_left);
+        for (std::size_t k = band.first; k < band.end; ++k) {
+            const double frequency = fft_freqs[k];
+            const double rising = (frequency - f_left) / (f_center - f_left);
+            const double falling = (f_right - frequency) / (f_right - f_center);
+            const double value = std::max(0.0, std::min(rising, falling));
+            result.values[band.offset + k - band.first] = value * enorm;
+        }
+    }
+    return result;
+}
+
+std::size_t parse_requested_threads() {
+    const char* text = std::getenv("MELSPEC_THREADS");
+    if (text == nullptr) return std::numeric_limits<std::size_t>::max();
+    if (*text == '\0')
+        throw std::invalid_argument(
+            "MELSPEC_THREADS must be a positive integer");
+
+    std::size_t value = 0;
+    for (const char* ch = text; *ch != '\0'; ++ch) {
+        if (*ch < '0' || *ch > '9')
+            throw std::invalid_argument(
+                "MELSPEC_THREADS must be a positive integer");
+        const std::size_t digit = static_cast<std::size_t>(*ch - '0');
+        if (value > (std::numeric_limits<std::size_t>::max() - digit) / 10) {
+            throw std::invalid_argument("MELSPEC_THREADS is too large");
+        }
+        value = value * 10 + digit;
+    }
+    if (value == 0)
+        throw std::invalid_argument(
+            "MELSPEC_THREADS must be a positive integer");
+    return value;
+}
+
+std::size_t usable_cpus() {
+#if defined(__linux__)
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+        const int count = CPU_COUNT(&set);
+        if (count > 0) return static_cast<std::size_t>(count);
+    }
+#endif
+    return std::max<std::size_t>(
+        1, static_cast<std::size_t>(std::thread::hardware_concurrency()));
+}
+
+std::size_t worker_count_for(std::size_t groups, std::size_t requested) {
+    return std::max<std::size_t>(
+        1, std::min(groups, std::min(requested, usable_cpus())));
+}
+
+void fft_inplace(std::vector<std::complex<double>>& values,
+                 const Twiddles& twiddles) {
+    const std::size_t n = values.size();
+    for (std::size_t i = 1, j = 0; i < n; ++i) {
+        std::size_t bit = n / 2;
+        for (; bit != 0 && (j & bit) != 0; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(values[i], values[j]);
+    }
+
+    for (std::size_t len = 2; len <= n;) {
+        const std::size_t half = len / 2;
+        for (std::size_t base = 0; base < n; base += len) {
+            for (std::size_t j = 0; j < half; ++j) {
+                const std::complex<double> u = values[base + j];
+                const std::complex<double> a = values[base + j + half];
+                const std::complex<double> w(twiddles.real[half + j],
+                                             twiddles.imag[half + j]);
+                const std::complex<double> v = a * w;
+                values[base + j] = u + v;
+                values[base + j + half] = u - v;
+            }
+        }
+        if (len == n) break;
+        len *= 2;
+    }
+}
+
+std::pair<std::size_t, std::size_t> group_range(std::size_t groups,
+                                                std::size_t worker,
+                                                std::size_t workers) {
+    const std::size_t base = groups / workers;
+    const std::size_t extra = groups % workers;
+    const std::size_t first = base * worker + std::min(worker, extra);
+    const std::size_t count = base + (worker < extra ? 1 : 0);
+    return {first, first + count};
+}
+
+}  // namespace
+
+// HTK mel scale conversions.
 double hz_to_mel(double f) {
     return 2595.0 * std::log10(1.0 + f / 700.0);
 }
@@ -20,145 +321,401 @@ double mel_to_hz(double m) {
     return 700.0 * (std::pow(10.0, m / 2595.0) - 1.0);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Cooley-Tukey iterative FFT (in-place, complex input/output)
-// ─────────────────────────────────────────────────────────────────────────────
-
-static void fft_inplace(std::vector<std::complex<double>>& a) {
-    const int n = static_cast<int>(a.size());
-    // Bit-reversal permutation
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) std::swap(a[i], a[j]);
-    }
-    // Cooley-Tukey butterfly stages
-    for (int len = 2; len <= n; len <<= 1) {
-        double ang = -2.0 * M_PI / static_cast<double>(len);
-        std::complex<double> wlen(std::cos(ang), std::sin(ang));
-        for (int i = 0; i < n; i += len) {
-            std::complex<double> w(1.0, 0.0);
-            for (int j = 0; j < len / 2; ++j) {
-                std::complex<double> u = a[i + j];
-                std::complex<double> v = a[i + j + len / 2] * w;
-                a[i + j] = u + v;
-                a[i + j + len / 2] = u - v;
-                w *= wlen;
-            }
-        }
-    }
-}
-
-// Real FFT: input n real values → output n/2+1 complex values.
+// Public complex FFT helper retained for callers that need the complete real
+// FFT.
 void compute_rfft(const std::vector<double>& frame,
                   std::vector<std::complex<double>>& out) {
-    const int n = static_cast<int>(frame.size());
-    // Copy real input into complex array
-    std::vector<std::complex<double>> a(n);
-    for (int i = 0; i < n; ++i) a[i] = {frame[i], 0.0};
-    fft_inplace(a);
-    // Keep only DC + positive frequencies (n/2+1 bins)
+    if (frame.empty() ||
+        frame.size() >
+            static_cast<std::size_t>(std::numeric_limits<int>::max()) ||
+        !is_power_of_two(static_cast<int>(frame.size()))) {
+        throw std::invalid_argument(
+            "RFFT input length must be a positive power of two");
+    }
+    const std::size_t n = frame.size();
+    std::vector<std::complex<double>> values(n);
+    for (std::size_t i = 0; i < n; ++i) values[i] = {frame[i], 0.0};
+    if (n > 1) fft_inplace(values, make_twiddles(n));
     out.resize(n / 2 + 1);
-    for (int k = 0; k <= n / 2; ++k) out[k] = a[k];
+    for (std::size_t k = 0; k <= n / 2; ++k) out[k] = values[k];
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Mel filterbank
-// ─────────────────────────────────────────────────────────────────────────────
-
+// Build the dense public filterbank representation.
 std::vector<std::vector<double>> build_mel_filterbank(int sr, int n_fft,
                                                       int n_mels, double f_min,
                                                       double f_max) {
-    const int n_bins = n_fft / 2 + 1;
-
-    // FFT bin center frequencies
-    std::vector<double> fft_freqs(n_bins);
-    for (int k = 0; k < n_bins; ++k)
-        fft_freqs[k] = static_cast<double>(k) * sr / static_cast<double>(n_fft);
-
-    // n_mels+2 equally-spaced mel points
-    double mel_min = hz_to_mel(f_min);
-    double mel_max = hz_to_mel(f_max);
-    std::vector<double> hz_points(n_mels + 2);
-    for (int i = 0; i <= n_mels + 1; ++i)
-        hz_points[i] =
-            mel_to_hz(mel_min + i * (mel_max - mel_min) / (n_mels + 1));
-
-    // Build triangular filters with Slaney area normalization
-    std::vector<std::vector<double>> weights(n_mels,
-                                             std::vector<double>(n_bins, 0.0));
-
+    validate_mel_parameters(sr, n_fft, n_mels, f_min, f_max);
+    const MelWeights compact =
+        make_compact_mel_weights(sr, n_fft, n_mels, f_min, f_max);
+    std::vector<std::vector<double>> dense(
+        static_cast<std::size_t>(n_mels),
+        std::vector<double>(compact.n_bins, 0.0));
     for (int m = 0; m < n_mels; ++m) {
-        double f_l = hz_points[m];
-        double f_c = hz_points[m + 1];
-        double f_r = hz_points[m + 2];
-        double enorm = 2.0 / (f_r - f_l);
-
-        for (int k = 0; k < n_bins; ++k) {
-            double rising = (fft_freqs[k] - f_l) / (f_c - f_l);
-            double falling = (f_r - fft_freqs[k]) / (f_r - f_c);
-            double val = std::max(0.0, std::min(rising, falling));
-            weights[m][k] = val * enorm;
+        const MelBand& band = compact.bands[static_cast<std::size_t>(m)];
+        for (std::size_t k = band.first; k < band.end; ++k) {
+            dense[static_cast<std::size_t>(m)][k] =
+                compact.values[band.offset + k - band.first];
         }
     }
-    return weights;
+    return dense;
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Mel spectrogram computation
-// ─────────────────────────────────────────────────────────────────────────────
 
 void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                             int hop_length, int n_mels, double f_min,
                             double f_max, std::vector<double>& output) {
-    const int n_samples = static_cast<int>(y.size());
-    const int n_frames = 1 + (n_samples - n_fft) / hop_length;
-    const int n_bins = n_fft / 2 + 1;
-
-    if (n_frames <= 0)
+    validate_mel_parameters(sr, n_fft, n_mels, f_min, f_max);
+    if (hop_length <= 0)
+        throw std::invalid_argument("hop_length must be positive");
+    if (y.size() < static_cast<std::size_t>(n_fft))
         throw std::runtime_error("Audio too short for given n_fft");
 
-    // Periodic Hann window: w[n] = 0.5 * (1 - cos(2*pi*n/n_fft))
-    std::vector<double> window(n_fft);
-    for (int i = 0; i < n_fft; ++i)
-        window[i] =
-            0.5 * (1.0 - std::cos(2.0 * M_PI * i / static_cast<double>(n_fft)));
+    const std::size_t n_samples = y.size();
+    const std::size_t fft_size = static_cast<std::size_t>(n_fft);
+    const std::size_t hop = static_cast<std::size_t>(hop_length);
+    const std::size_t n_frames = 1 + (n_samples - fft_size) / hop;
+    const std::size_t mel_count = static_cast<std::size_t>(n_mels);
+    if (n_frames > std::numeric_limits<std::size_t>::max() / mel_count)
+        throw std::length_error("Output element count overflows size_t");
+    const std::size_t output_count = mel_count * n_frames;
 
-    // Power spectrum: power_spec[k][t], shape (n_bins, n_frames)
-    std::vector<std::vector<double>> power_spec(n_bins,
-                                                std::vector<double>(n_frames));
+    const std::size_t requested_threads = parse_requested_threads();
+    const MelWeights mel =
+        make_compact_mel_weights(sr, n_fft, n_mels, f_min, f_max);
 
-    for (int t = 0; t < n_frames; ++t) {
-        int start = t * hop_length;
+    // Preserve the input before resize if callers intentionally reuse one
+    // vector for both input and output. The ordinary out-of-place path does
+    // not copy the signal.
+    std::vector<double> alias_input;
+    const std::vector<double>* input = &y;
+    if (&y == &output) {
+        alias_input = y;
+        input = &alias_input;
+    }
+    const double* input_samples = input->data();
+    output.resize(output_count);
 
-        // Window the frame
-        std::vector<double> frame(n_fft);
-        for (int i = 0; i < n_fft; ++i) frame[i] = y[start + i] * window[i];
+    // The periodic Hann window of length one is exactly zero.
+    if (n_fft == 1) {
+        std::fill(output.begin(), output.end(), 0.0);
+        return;
+    }
 
-        // FFT
-        std::vector<std::complex<double>> fft_out;
-        compute_rfft(frame, fft_out);
+    std::vector<double> window(fft_size);
+    for (std::size_t i = 0; i < fft_size; ++i) {
+        window[i] = 0.5 * (1.0 - std::cos(2.0 * kPi * static_cast<double>(i) /
+                                          static_cast<double>(fft_size)));
+    }
 
-        // |X|^2
-        for (int k = 0; k < n_bins; ++k) {
-            double re = fft_out[k].real();
-            double im = fft_out[k].imag();
-            power_spec[k][t] = re * re + im * im;
+    const std::size_t half_fft = fft_size / 2;
+    const std::size_t n_bins = half_fft + 1;
+    const Twiddles twiddles = make_twiddles(half_fft);
+    std::vector<double> rfft_twiddle_real(n_bins);
+    std::vector<double> rfft_twiddle_imag(n_bins);
+    for (std::size_t k = 0; k < n_bins; ++k) {
+        const double angle =
+            -2.0 * kPi * static_cast<double>(k) / static_cast<double>(fft_size);
+        rfft_twiddle_real[k] = std::cos(angle);
+        rfft_twiddle_imag[k] = std::sin(angle);
+    }
+
+    std::vector<std::size_t> bit_reverse(half_fft);
+    for (std::size_t i = 0, reversed = 0; i < half_fft; ++i) {
+        bit_reverse[i] = reversed;
+        std::size_t bit = half_fft / 2;
+        for (; bit != 0 && (reversed & bit) != 0; bit >>= 1) {
+            reversed ^= bit;
+        }
+        reversed ^= bit;
+    }
+
+    std::size_t active_first = n_bins;
+    std::size_t active_end = 0;
+    for (const MelBand& band : mel.bands) {
+        if (band.first == band.end) continue;
+        active_first = std::min(active_first, band.first);
+        active_end = std::max(active_end, band.end);
+    }
+    const bool low_power_only = active_end <= half_fft / 2 + 1;
+
+    const std::size_t group_count =
+        n_frames / kFrameLanes + (n_frames % kFrameLanes != 0 ? 1 : 0);
+    const std::size_t workers =
+        worker_count_for(group_count, requested_threads);
+
+    auto process_block = [&](std::size_t first_group, std::size_t end_group) {
+        const std::size_t begin =
+            first_group *
+            kFrameLanes;  // first_group is strictly before the last group
+        const std::size_t end =
+            end_group == group_count ? n_frames : end_group * kFrameLanes;
+
+        const std::size_t scratch_count = half_fft * 2 + n_bins;
+        std::vector<FrameVec> scratch(scratch_count);
+        FrameVec* real = scratch.data();
+        FrameVec* imag = real + half_fft;
+        FrameVec* power = imag + half_fft;
+        double input_lanes[kFrameLanes];
+
+        for (std::size_t frame = begin; frame < end;) {
+            const std::size_t count = std::min(kFrameLanes, end - frame);
+            const std::size_t last_frame = frame + count - 1;
+            for (std::size_t i = 0; i < half_fft; ++i) {
+                const std::size_t reversed = bit_reverse[i];
+                for (std::size_t lane = 0; lane < kFrameLanes; ++lane) {
+                    const std::size_t current_frame =
+                        lane < count ? frame + lane : last_frame;
+                    const std::size_t sample = current_frame * hop;
+                    input_lanes[lane] =
+                        input_samples[sample + 2 * i] * window[2 * i];
+                }
+                real[reversed] = make_frame_vec(input_lanes);
+                for (std::size_t lane = 0; lane < kFrameLanes; ++lane) {
+                    const std::size_t current_frame =
+                        lane < count ? frame + lane : last_frame;
+                    const std::size_t sample = current_frame * hop;
+                    input_lanes[lane] =
+                        input_samples[sample + 2 * i + 1] * window[2 * i + 1];
+                }
+                imag[reversed] = make_frame_vec(input_lanes);
+            }
+
+#if MELSPEC_FUSED_FFT
+            std::size_t len = 2;
+            for (; len <= half_fft / 2; len *= 4) {
+                const std::size_t q = len / 2;
+                const std::size_t two_len = 2 * len;
+                for (std::size_t base = 0; base < half_fft;
+                     base += two_len) {
+                    for (std::size_t j = 0; j < q; ++j) {
+                        const std::size_t a = base + j;
+                        const std::size_t b = a + q;
+                        const std::size_t c = a + len;
+                        const std::size_t d = c + q;
+
+                        const FrameVec a_real = real[a];
+                        const FrameVec a_imag = imag[a];
+                        const FrameVec b_real = real[b];
+                        const FrameVec b_imag = imag[b];
+                        const FrameVec c_real = real[c];
+                        const FrameVec c_imag = imag[c];
+                        const FrameVec d_real = real[d];
+                        const FrameVec d_imag = imag[d];
+
+                        const std::size_t first_twiddle = q + j;
+                        const double first_wr = twiddles.real[first_twiddle];
+                        const double first_wi = twiddles.imag[first_twiddle];
+                        const FrameVec t_real =
+                            b_real * first_wr - b_imag * first_wi;
+                        const FrameVec t_imag =
+                            b_real * first_wi + b_imag * first_wr;
+                        const FrameVec u_real =
+                            d_real * first_wr - d_imag * first_wi;
+                        const FrameVec u_imag =
+                            d_real * first_wi + d_imag * first_wr;
+
+                        const FrameVec upper_a_real = a_real + t_real;
+                        const FrameVec upper_a_imag = a_imag + t_imag;
+                        const FrameVec upper_b_real = a_real - t_real;
+                        const FrameVec upper_b_imag = a_imag - t_imag;
+                        const FrameVec upper_c_real = c_real + u_real;
+                        const FrameVec upper_c_imag = c_imag + u_imag;
+                        const FrameVec upper_d_real = c_real - u_real;
+                        const FrameVec upper_d_imag = c_imag - u_imag;
+
+                        const std::size_t second_twiddle_a = len + j;
+                        const std::size_t second_twiddle_b = len + j + q;
+                        const double second_a_wr =
+                            twiddles.real[second_twiddle_a];
+                        const double second_a_wi =
+                            twiddles.imag[second_twiddle_a];
+                        const double second_b_wr =
+                            twiddles.real[second_twiddle_b];
+                        const double second_b_wi =
+                            twiddles.imag[second_twiddle_b];
+                        const FrameVec v_real =
+                            upper_c_real * second_a_wr -
+                            upper_c_imag * second_a_wi;
+                        const FrameVec v_imag =
+                            upper_c_real * second_a_wi +
+                            upper_c_imag * second_a_wr;
+                        const FrameVec z_real =
+                            upper_d_real * second_b_wr -
+                            upper_d_imag * second_b_wi;
+                        const FrameVec z_imag =
+                            upper_d_real * second_b_wi +
+                            upper_d_imag * second_b_wr;
+
+                        real[a] = upper_a_real + v_real;
+                        imag[a] = upper_a_imag + v_imag;
+                        real[b] = upper_b_real + z_real;
+                        imag[b] = upper_b_imag + z_imag;
+                        real[c] = upper_a_real - v_real;
+                        imag[c] = upper_a_imag - v_imag;
+                        real[d] = upper_b_real - z_real;
+                        imag[d] = upper_b_imag - z_imag;
+                    }
+                }
+            }
+#else
+            std::size_t len = 2;
+#endif
+            for (; len <= half_fft;) {
+                const std::size_t stage_half = len / 2;
+                for (std::size_t base = 0; base < half_fft; base += len) {
+                    for (std::size_t j = 0; j < stage_half; ++j) {
+                        const std::size_t left = base + j;
+                        const std::size_t right = left + stage_half;
+                        const double wr = twiddles.real[stage_half + j];
+                        const double wi = twiddles.imag[stage_half + j];
+                        const FrameVec ar = real[right];
+                        const FrameVec ai = imag[right];
+                        const FrameVec vr = ar * wr - ai * wi;
+                        const FrameVec vi = ar * wi + ai * wr;
+                        const FrameVec ur = real[left];
+                        const FrameVec ui = imag[left];
+                        real[left] = ur + vr;
+                        imag[left] = ui + vi;
+                        real[right] = ur - vr;
+                        imag[right] = ui - vi;
+                    }
+                }
+                if (len == half_fft) break;
+                len *= 2;
+            }
+
+            if (low_power_only) {
+                if (active_first == 0 && active_end > 0) {
+                    const FrameVec dc = real[0] + imag[0];
+                    power[0] = dc * dc;
+                }
+                if ((half_fft & 1u) == 0) {
+                    const std::size_t center = half_fft / 2;
+                    if (active_first <= center && center < active_end) {
+                        power[center] = real[center] * real[center] +
+                                        imag[center] * imag[center];
+                    }
+                }
+
+                const std::size_t first =
+                    std::max<std::size_t>(active_first, 1);
+                const std::size_t end =
+                    std::min(active_end, (half_fft + 1) / 2);
+                for (std::size_t k = first; k < end; ++k) {
+                    const std::size_t partner = half_fft - k;
+                    const FrameVec left_real = real[k];
+                    const FrameVec left_imag = imag[k];
+                    const FrameVec right_real = real[partner];
+                    const FrameVec right_imag = imag[partner];
+                    const FrameVec sum_real = left_real + right_real;
+                    const FrameVec sum_imag = left_imag - right_imag;
+                    const FrameVec diff_real = left_real - right_real;
+                    const FrameVec diff_imag = left_imag + right_imag;
+                    const double wr = rfft_twiddle_real[k];
+                    const double wi = rfft_twiddle_imag[k];
+                    const FrameVec correction_real =
+                        wr * diff_imag + wi * diff_real;
+                    const FrameVec correction_imag =
+                        -wr * diff_real + wi * diff_imag;
+                    const FrameVec bin_real =
+                        0.5 * (sum_real + correction_real);
+                    const FrameVec bin_imag =
+                        0.5 * (sum_imag + correction_imag);
+                    power[k] = bin_real * bin_real + bin_imag * bin_imag;
+                }
+            } else {
+                const FrameVec dc = real[0] + imag[0];
+                const FrameVec nyquist = real[0] - imag[0];
+                power[0] = dc * dc;
+                power[half_fft] = nyquist * nyquist;
+
+                for (std::size_t k = 1; k <= half_fft / 2; ++k) {
+                    const std::size_t partner = half_fft - k;
+                    const FrameVec left_real = real[k];
+                    const FrameVec left_imag = imag[k];
+                    const FrameVec right_real = real[partner];
+                    const FrameVec right_imag = imag[partner];
+                    const FrameVec sum_real = left_real + right_real;
+                    const FrameVec sum_imag = left_imag - right_imag;
+                    const FrameVec diff_real = left_real - right_real;
+                    const FrameVec diff_imag = left_imag + right_imag;
+                    const double wr = rfft_twiddle_real[k];
+                    const double wi = rfft_twiddle_imag[k];
+                    const FrameVec correction_real =
+                        wr * diff_imag + wi * diff_real;
+                    const FrameVec correction_imag =
+                        -wr * diff_real + wi * diff_imag;
+                    const FrameVec bin_real =
+                        0.5 * (sum_real + correction_real);
+                    const FrameVec bin_imag =
+                        0.5 * (sum_imag + correction_imag);
+                    power[k] = bin_real * bin_real + bin_imag * bin_imag;
+                    if (partner != k) {
+                        const FrameVec partner_real =
+                            0.5 * (sum_real - correction_real);
+                        const FrameVec partner_imag =
+                            0.5 * (-sum_imag + correction_imag);
+                        power[partner] = partner_real * partner_real +
+                                         partner_imag * partner_imag;
+                    }
+                }
+            }
+
+            for (int m = 0; m < n_mels; ++m) {
+                const MelBand& band = mel.bands[static_cast<std::size_t>(m)];
+                FrameVec acc = zero_frame_vec();
+                for (std::size_t k = band.first; k < band.end; ++k) {
+                    acc += power[k] * mel.values[band.offset + k - band.first];
+                }
+                double* destination = output.data() +
+                                      static_cast<std::size_t>(m) * n_frames +
+                                      frame;
+                for (std::size_t lane = 0; lane < count; ++lane) {
+                    destination[lane] = frame_lane(acc, lane);
+                }
+            }
+            frame += count;
+        }
+    };
+
+    if (workers == 1) {
+        process_block(0, group_count);
+        return;
+    }
+
+    std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> worker_errors(workers);
+    threads.reserve(workers - 1);
+    std::exception_ptr launch_error;
+    for (std::size_t worker = 1; worker < workers; ++worker) {
+        const auto range = group_range(group_count, worker, workers);
+        try {
+            threads.emplace_back([&, worker, range] {
+                try {
+                    process_block(range.first, range.second);
+                } catch (...) {
+                    worker_errors[worker] = std::current_exception();
+                }
+            });
+        } catch (...) {
+            launch_error = std::current_exception();
+            break;
         }
     }
 
-    // Build mel filterbank: mel_fb[m][k]
-    auto mel_fb = build_mel_filterbank(sr, n_fft, n_mels, f_min, f_max);
-
-    // Apply filterbank: output[m][t] = sum_k mel_fb[m][k] * power_spec[k][t]
-    output.resize(static_cast<size_t>(n_mels) * n_frames);
-    for (int m = 0; m < n_mels; ++m) {
-        for (int t = 0; t < n_frames; ++t) {
-            double acc = 0.0;
-            for (int k = 0; k < n_bins; ++k)
-                acc += mel_fb[m][k] * power_spec[k][t];
-            output[m * n_frames + t] = acc;
+    std::exception_ptr main_error;
+    if (!launch_error) {
+        const auto range = group_range(group_count, 0, workers);
+        try {
+            process_block(range.first, range.second);
+        } catch (...) {
+            main_error = std::current_exception();
         }
+    }
+    for (std::thread& thread : threads) thread.join();
+
+    if (launch_error) std::rethrow_exception(launch_error);
+    if (main_error) std::rethrow_exception(main_error);
+    for (const std::exception_ptr& error : worker_errors) {
+        if (error) std::rethrow_exception(error);
     }
 }
