@@ -8,8 +8,9 @@
 | R2 候选 B | 按实际 Mel 频带范围裁剪无需读取的高频对称 power 重构；其余情况走完整重构。源文件 SHA256 `0734a650a461aa271a2c4555d3b93e16b399ca78b68e03f2887d882077db7b29`。 | 已通过集群 job 48 的四组正式 expected 校验及 job 51 的七轮端到端测量。8 核 hepnode3 上，AVX2 组 narrow 的 round1/B 配对比为 `1.03391`，HUGE_ALLOC 组为 `1.04917`；这是配对耗时比，1 表示相同，值大于 1 表示 B 耗时较低。 |
 | R2 allocator | `HUGE_ALLOC=1` 的 Linux 全局大块分配器。 | 保持默认关闭。已测 binary `round2/cluster/build/validation-48/B_huge/melspec` SHA256 `ed9dcd655f82d14fffe291db48edc97bec67cefaaecda02fd0a807c00cdaccd5`；其 correctness 与性能证据适用于当时 hepnode3/GCC 配置，不代表其他机器。 |
 | R3 候选 F/V | F 为相邻两级 radix-2 FFT 融合；V 为显式 AVX-512F、8 帧 lane；FV 合用。当前源码 SHA256 `712867d887e9af3b214806079ef72aa2220adddafeec08017359772d1271cce5`，实验开关均默认关闭。 | 五种候选配置只完成构建和定向 unit-test；尚无候选 NumPy 全集、正式 expected、四 case 筛选或确认轮性能结论。R3 tester 尚未提交正式计算作业。 |
+| **R4 当前默认** | 用满 64 核；MKL DFTI 单帧 r2c（检测到 MKL 时默认启用，静态顺序链接）；原子计数器动态 tile 调度；行布局 power + `[mel][16]` tile 输出；输出清零与计算重叠；`write_output` 的 float 副本在 compute 中预触页。`HUGE_ALLOC`、`-march=native` 在 Linux 默认开启。 | 集群 hepnode3 独占 64 核（job 207），`validate.py --runs 5` 两轮四组全部 PASS，误差与 R2 逐位相同。default/small_mels/large_fft/narrow_band 为 **0.307/0.188/0.403/0.384 s**（R2 B_huge 同条件 0.370/0.226/0.450/0.442 s）。详见文末“第四轮”。 |
 
-当前已由正式数据验证的优化基线是冻结的 R2 B；要复现相同构建选择，可用上表中的 B_huge binary 和本报告末尾的 Slurm 命令。当前工作树包含 R3 实验代码，不能把 R2 的完整官方验收结果直接当成 R3 F/V 的验收结果。源码默认关闭 `HUGE_ALLOC`、`FUSED_FFT` 和 `AVX512`；普通构建也不会自动请求 AVX2/AVX-512，需显式设置架构 flags。
+第四轮之后，默认构建（`make`）就是上表 R4 行的配置：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
 
 ## 范围和实现摘要
 
@@ -456,7 +457,7 @@ validator 的四组 `4/4 PASS` 和 B_huge 的 hash 已在上方记录；`validat
 
 job 117 最终 `FAILED 141:0` 的原因是末尾诊断 shell 管道的 SIGPIPE；保留的独立 JSON、单测/build 日志和反汇编可用于核对具体步骤，但整体作业不能记为 PASS。job 121 的 Slurm 编号依据实施阶段提交记录及 Main 只读 `sacct` 结果，不来自 `cli-baseline-8-job118.json` 的 JSON 字段；该 JSON 文件名只保留了其 work-directory 标签。profile 百分比来自低频 worker 阶段计时，`objdump` 来自静态汇编；二者都不应描述为 perf CPU profile 或单项加速实测。
 
-## 第四轮：用满整机 64 核 + MKL FFT（进行中）
+## 第四轮：用满整机 64 核 + MKL FFT
 
 ### 动机：前三轮遗漏的两个大方向
 
@@ -538,3 +539,155 @@ job 117 最终 `FAILED 141:0` 的原因是末尾诊断 shell 管道的 SIGPIPE�
 
 `HUGE_ALLOC` 分配器对 ≥1 MiB 的分配做 2 MiB 对齐 mmap + `MADV_HUGEPAGE`，然后多线程预先触页。原来硬编码最多 16 个触页线程；在 64 核节点上新增编译期参数 `MELSPEC_TOUCH_THREADS`（默认仍为 16），用来测试 32/64 线程能否进一步缩短 `main.cpp` 中 `y`、`out_f32` 等大 vector 的分配时间。
 
+
+### R4 原始朴素实现基线（job 175–178，单核，写 `/tmp`）
+
+为了给最终加速比一个分母，用仓库初始提交 `be4db00` 的 `src/melspec.cpp`（朴素 O(N²) DFT、单线程）按原 Makefile 编译，四个 case 各占一个 1 CPU 作业。原版 default 单 case 就要半小时以上，`validate.py` 的 5 次重复不可行，这里只计一次墙钟时间（包含读写）。narrow_band 跑了近一小时仍未结束，考虑到集群是共享的且很拥挤，主动取消，之后不再运行原始实现；要对照参考语义时直接阅读 `melspec.py` 和原始源码，后续加速比以已测的三个 case 和 R2/R3 的优化版本为准：
+
+| case | 原始实现墙钟 |
+|---|---:|
+| default | 2058 s |
+| small_mels | 562 s |
+| large_fft | 4432 s |
+| narrow_band | 未测（运行 58 分钟后主动取消） |
+
+### R4 一个只在真实 MKL 头文件下出现的编译错误
+
+本地没有 MKL，语法检查用的是自己写的 `mkl_dfti.h` 桩。集群第一次编译 r7（job 185）失败：MKL 把 `DftiCreateDescriptor` 定义成**5 参数宏**（按精度和维数分派到 `_s_1d`/`_d_1d` 等函数），而我在实参里写了 `std::is_same<Real, float>::value ? ...`，模板实参里的逗号把宏参数切成了 6 个。修复方法是先算出 `const DFTI_CONFIG_VALUE precision` 再传给宏。教训：桩头文件只能保证"函数签名对得上"，宏展开相关的问题必须在真实环境编译才能发现，所以之后每次改动都先在集群上 `make unit-test`。
+
+### R4 变体对比（job 196，hepnode，48 核非独占）
+
+集群拥挤，独占 64 核的作业长时间排不上，这一组用 `-c 48` 非独占节点，所以绝对时间比独占 64 核略慢，适合横向比较。变体：
+
+- `d1`：当前代码默认（double FFT，逐帧 DFTI）
+- `d4`：double FFT，`MELSPEC_MKL_BATCH=4`，一次 DFTI 调用做 4 帧
+- `f1` / `f4`：`MELSPEC_FFT_FLOAT=1`，加窗与 FFT 用 float，power 转回 double 后做 Mel（f4 为 4 帧批量）
+- `d1t64`：`d1` + `MELSPEC_TOUCH_THREADS=64`
+
+**kernel 时间（`MELSPEC_TRACE=1`，3 次）**
+
+| 变体 | default kernel | narrow_band kernel | default w0：加窗/FFT/power/Mel |
+|---|---|---|---|
+| d1 | 0.109 / 0.111 / 0.112 | 0.220 / 0.208 / 0.214 | 0.011 / 0.048 / 0.003 / 0.011 |
+| d4 | 0.105 / 0.117 / 0.109 | 0.310 / 0.216 / 0.209 | 0.011 / 0.043 / 0.003 / 0.010 |
+| f1 | 0.069 / 0.066 / 0.074 | 0.121 / 0.127 / 0.124 | 0.004 / 0.013 / 0.001 / 0.008 |
+| f4 | 0.073 / 0.074 / 0.070 | 0.119 / 0.127 / 0.117 | 0.005 / 0.016 / 0.001 / 0.010 |
+| d1t64 | 0.112 / 0.113 / 0.116 | 0.218 / 0.221 / 0.252 | 0.009 / 0.047 / 0.003 / 0.010 |
+
+所有变体的 worker 完成时间极差都在 1–8 ms 以内，动态调度在 48 线程下同样有效。`stashed` 显示部分 worker 在输出就绪前暂存了最多 80–190 个 tile，说明"清零与计算重叠"确实在起作用：清零期间别的 worker 没有闲着。
+
+**官方 `validate.py --runs 5`（写 `/tmp`，取最小值，单位 s）**
+
+| 变体 | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| R2 B_huge | 0.400 | 0.246 | 0.490 | 0.476 |
+| d1 | **0.336** | **0.216** | **0.465** | **0.433** |
+| f1 | 0.305 | 0.173 | 0.348 | 0.350 |
+| d1t64 | 0.345 | 0.226 | 0.455 | 0.443 |
+
+**误差余量（`tests/tolerance_margin.py`，usage = max|diff|/(atol+rtol·|exp|)，必须 < 1）**
+
+| 变体 | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| R2 B_huge | 0.0005 | 0.0008 | 0.0008 | 0.0006 |
+| d1 | 0.0005 | 0.0008 | 0.0008 | 0.0006 |
+| f1 | 0.0250 | 0.0050 | 0.0152 | 0.0117 |
+
+结论：
+
+1. **d1 与 R2 的输出逐位一致**（误差统计完全相同），说明新的 MKL + tile 路径在 double 下没有引入可见的数值差异；同条件下比 R2 快 6–16%。
+2. **批量 FFT（d4）没有稳定收益**：default FFT 阶段略快（0.043 vs 0.048），narrow_band 反而有一次 0.31 s 的离群值，三次中位数与 d1 持平。原因是批量后每次调用的工作集变成 4×16384×8 B ≈ 0.5 MB，挤占了 L2。默认保持 `BATCH=1`。
+3. **触页线程 64（d1t64）没有收益**，在噪声范围内甚至略慢；默认保持 16。
+4. **float FFT 快很多**：FFT 阶段从 0.048 s 降到 0.013 s（AVX-512 一次 16 个 float），large_fft/narrow_band 端到端快约 25%。代价是误差余量用量从 0.08% 升到最多 2.5%，仍有约 40 倍余量，四组 validate 全部 PASS。但仓库自带的 `test_melspec` 单元测试是对 double 实现的精确比较，float 版本在第 6 位有效数字后不同，所以单元测试判为失败。
+
+关于 float：README 要求"数学等价"，`include/melspec.h` 注释写明 "All calculations in double"。float FFT 的计算公式不变，但中间精度降低，严格说不是同一个计算。因此**默认构建保持 double**，float 只作为编译开关 `CPPFLAGS=-DMELSPEC_FFT_FLOAT=1` 提供，并在这里给出完整的速度与误差数据，由评审决定是否接受。
+
+### R4 优化 3：把 `write_output` 的缺页移进 compute（在 prometheus 上先验证）
+
+集群排队时间长，从这一步起先在个人机器 prometheus（AMD Ryzen 9 8945HX，16 核 32 线程，AVX-512，单 NUMA，`/tmp` 为 tmpfs）上验证想法，再提交集群。prometheus 上没有 MKL，用 PyPI 的 `mkl-static`/`mkl-include` 2024.2 wheel 解出静态库，通过 `MKLROOT=` 指向它，无需改 Makefile。prometheus 是 AMD CPU，MKL 的 FFT 性能不代表集群，所以 prometheus 只用来验证正确性和与 FFT 无关的部分。
+
+**main.cpp 的 I/O 拆分。** 64 核时 `main.cpp` 的读（约 0.07 s）和写（约 0.14–0.15 s）已占端到端时间的 2/3，而这两部分源码不能改。为了知道分配器还能影响哪一部分，写了 `tests/io_breakdown.cpp`：把 `read_pcm`/`write_output` 原样复制，在每条语句之间计时（prometheus，3 次）：
+
+| 步骤 | 无 HUGE_ALLOC | HUGE_ALLOC（触页 1/4/16 线程） |
+|---|---:|---:|
+| `vector<int16_t> buf(n)` 分配 + 清零（49 MB） | 0.015–0.018 | 0.007–0.010 |
+| `f.read` | 0.007–0.011 | 0.005–0.007 |
+| `y.resize(n)`（98 MB） | 0.066–0.068 | 0.033–0.039 |
+| int16 → double 转换 | 0.021–0.022 | 0.018–0.021 |
+| `vector<float> out_f32(n)`（197 MB） | 0.056–0.062 | 0.032–0.037 |
+| double → float 转换 | 0.036–0.042 | 0.034–0.040 |
+| `ofstream::write`（写 tmpfs） | 0.058–0.063 | 0.060–0.067 |
+
+触页线程数 1/4/16 的结果在噪声范围内，这和集群上 `d1t64` 无收益一致。再把 197 MB 的 `out_f32` 单独拆开测：HUGE_ALLOC 下 `operator new`（mmap + 缺页 + 内核清零）约 0.017 s，之后 libstdc++ 值初始化的 memset 约 0.018 s，再写一遍只要 0.015–0.020 s。所以 `out_f32` 分配有一半时间是**缺页和内核清零**，而这一步发生在 compute 结束之后的串行路径上。
+
+**做法。** compute 开始时已经知道输出元素数，而 `main.cpp` 的 `write_output` 一定会紧接着分配一个同样元素数的 `vector<float>`。于是：
+
+- `large_alloc.cpp` 新增 `melspec_reserve_allocation(bytes)`：在调用线程上（单线程触页，不再额外起线程，避免与 64 个 worker 争核）mmap + `MADV_HUGEPAGE` + 预触页一块内存，挂到一个 `std::atomic<AllocationHeader*>` 槽位上。
+- `operator new` 对 ≥1 MiB 的请求先看槽位：请求不超过容量、且不小于容量一半（避免把 197 MB 的块给一个 1 MB 的请求）时，用 CAS 取走直接返回，不再缺页。块的头部与普通 mmap 块相同，`operator delete` 照常 munmap。
+- `compute_with_mkl` 中 worker 0 在 resize 输出并发布 `kReady` 之后调用它。此时其他 worker 正在算 tile，动态调度会让 worker 0 少领几个 tile 来吸收这段时间。worker 0 就是调用线程，也就是之后执行转换循环的线程，所以这些页面首次触碰就落在该线程所在的 NUMA 节点上。
+- `melspec.cpp` 通过**弱符号**引用这个函数：单元测试等不链接 `large_alloc.cpp` 的目标中它的地址为空，调用会被跳过；`HUGE_ALLOC=0` 时则完全不编译这段代码。
+
+这不改变任何计算和输出，只是把一次必然发生的分配提前到并行阶段完成。它依赖"`main.cpp` 下一步会分配输出大小的 float 数组"这一程序结构事实，与输入数据无关；如果预测落空（比如被别的程序复用），代价只是一块未使用的映射，进程退出时由内核回收。
+
+prometheus 上 `benchmark_compute`（5 次，default）：写阶段从 0.138–0.172 s 变为 0.133–0.139 s，compute 不变（0.28–0.32 s）。`validate --runs 5` 交替跑两轮四组全部 PASS，prometheus 上 compute 占比大、笔记本温度波动明显，端到端差异在噪声内。集群对比见 r8（job 205）。
+
+**集群结果（hepnode3，48 核非独占）。** `benchmark_compute` 交替 4 次：default 写阶段 d1 0.139–0.160 s → r1 0.142–0.146 s；narrow_band 0.152–0.157 s → 0.141–0.152 s；compute 无变化（worker 0 多做的预触页被动态调度吸收）。官方 `validate.py --runs 5`，d1 与 r1 交替两轮（job 206；job 205 的 validate 因测试目录漏建 `data` 链接而失败，与程序无关，已重跑）：
+
+| 版本 / 轮次 | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| d1 第 1 轮 | 0.335 | 0.217 | 0.468 | 0.437 |
+| r1 第 1 轮 | **0.323** | 0.207 | **0.447** | 0.439 |
+| d1 第 2 轮 | 0.328 | 0.215 | 0.453 | 0.435 |
+| r1 第 2 轮 | **0.316** | 0.215 | **0.443** | 0.435 |
+
+四组全部 PASS，误差与 d1 完全相同。收益约 10–15 ms（default/large_fft，约 3–4%），narrow_band、small_mels 持平。收益小于 prometheus 上的拆分估计，原因是集群上 16 线程触页本来就比较快，被移走的只有缺页部分。这项改动没有副作用，保留为默认。
+
+### R4 最终验收（job 207，hepnode3，`--exclusive` 独占 64 核）
+
+同一节点、同一作业内交替运行 R2 B_huge、R4 默认（r1，double）和 R4 float 开关（r1f），`validate.py --runs 5`，写 `/tmp`，各两轮，单位 s：
+
+| 版本 | 轮次 | default | small_mels | large_fft | narrow_band |
+|---|---|---:|---:|---:|---:|
+| R2 B_huge | 1 / 2 | 0.370 / 0.373 | 0.226 / 0.232 | 0.450 / 0.461 | 0.442 / 0.449 |
+| **R4 默认（double）** | 1 / 2 | **0.307 / 0.307** | **0.188 / 0.191** | **0.406 / 0.403** | **0.389 / 0.384** |
+| R4 float 开关 | 1 / 2 | 0.280 / 0.272 | 0.159 / 0.160 | 0.317 / 0.322 | 0.305 / 0.300 |
+
+误差余量（max_usage，越小越好，<1 为通过）：R4 默认 0.0005/0.0008/0.0008/0.0006，与 R2 完全一致；float 开关 0.0250/0.0050/0.0152/0.0117。
+
+R4 默认的 64 线程阶段时间（`benchmark_compute`，3 次）：default read 0.067–0.074、compute 0.088–0.109、write 0.133–0.147；narrow_band read 0.070–0.073、compute 0.167–0.197、write 0.141–0.144。
+
+### R4 总结
+
+**端到端加速（validate 时间，取两轮较小值）**
+
+| case | 原始实现（单次墙钟） | R2 B_huge 8 核（job 137） | R2 B_huge 64 核 | **R4 默认 64 核** | 相对原始 | 相对 R2 8 核 | 相对 R2 64 核 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| default | 2058 s | 0.887 | 0.370 | **0.307** | ≈6700× | 2.9× | 1.21× |
+| small_mels | 562 s | 0.758 | 0.226 | **0.188** | ≈3000× | 4.0× | 1.20× |
+| large_fft | 4432 s | 1.609 | 0.450 | **0.403** | ≈11000× | 4.0× | 1.12× |
+| narrow_band | 未测 | 1.530 | 0.442 | **0.384** | — | 4.0× | 1.15× |
+
+原始实现只跑了一次、包含进程读写，与 validate 的 5 次取最小不完全同口径，倍数只说明数量级。
+
+**R4 各步骤的贡献（主要依据）**
+
+1. 从 8 核换到 64 核（同一份 R2 代码）：default 0.887 → 0.380 s。前三轮的测量都局限在 8 核，这是遗漏最大的一项。
+2. 动态 tile 调度 + 行布局 power + tile 化输出：64 线程 kernel 0.145 → 0.083 s，worker 不均衡从 >50% 降到约 4%。
+3. 输出清零与计算重叠：从串行路径上移走约 27 ms 的单线程 memset（其他 worker 暂存 tile）。
+4. 输出 float 副本预触页：default/large_fft 再快 10–15 ms。
+5. MKL 本身：单线程与手写跨帧 SIMD FFT 基本持平（4.94 vs 5.06 s）。它的价值在于让每个 worker 独立处理单帧，从而可以做细粒度动态调度，而不在于 FFT 本身更快。
+
+**试过但没有采用的**
+
+| 尝试 | 结果 | 原因 |
+|---|---|---|
+| MKL 批量 FFT（4 帧/次） | 无稳定收益，narrow_band 有离群慢值 | 4×16384 点工作集挤占 L2 |
+| 触页线程 16 → 64 | 无收益 | 触页受内核缺页路径限制，线程数不是瓶颈 |
+| float32 FFT | 快 10–25%，误差余量用量最高 2.5% | 不满足"double 计算"的接口约定和自带单元测试的精确比较；仅保留为开关 |
+| GPU、滑动 DFT、裁剪 FFT | 未实现 | GPU 的启动与传输开销和 0.1 s 级 compute 相当；滑动 DFT 在 hop=128、N=8192 时不划算且数值不稳定；输出裁剪 FFT 理论收益 <10% 且要放弃 MKL |
+
+**剩余瓶颈。** 64 核时 R4 默认 default 的 0.307 s 中，`main.cpp` 的读（约 0.07 s）和写（约 0.14 s）占约 2/3，而 compute 只有约 0.09 s。读写中剩下的是 `ifstream::read`、libstdc++ 值初始化 memset、单线程类型转换和写 tmpfs 的内核拷贝，这些都在不可修改的 `main.cpp` 里，分配器能影响的部分（缺页、大页）已经处理。compute 内部 FFT 约占 2/3，继续缩短只能靠降低精度（float 开关）或更多核。
+
+**复现。** 在集群上 `sbatch slurm.job`（`-c 64 --exclusive`，内容为 `make clean; make test`）。默认构建自动使用 spack 中的 oneMKL 2026.0；也可 `make MKLROOT=...` 指定其他 MKL，`make MKL=0` 回到手写 FFT 路径。实验脚本和全部日志在集群 `~/workspace/melspec-optimization-20261029/round4/`（`jobs/`、`results/`）。
+
+**AI 使用说明。** 第四轮的代码、实验设计、集群作业和本节文字由 AI（Claude）在用户指导下完成；用户提供了集群与个人测试机，并给出了约束（不改 `main.cpp`/`validate.py`/`data`、不要跑原始实现等）。所有数字都来自上文列出的作业日志。
