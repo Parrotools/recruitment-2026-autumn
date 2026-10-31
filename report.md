@@ -1150,3 +1150,44 @@ store 在 default 上约占 compute 的 9%。每次写缺失都要先把缓存�
 绕开每次启动开销的唯一办法，是在 `slurm.job` 中先用 `srun` 在另一台节点上启动常驻的服务进程，`melspec` 每次运行时通过套接字或 RDMA 把任务交给它。这样就不是 MPI 了，而且仍不划算：远端从 BeeGFS 读 49 MB 输入要约 0.028 s（R6 实测），99 MB 结果经 IPoIB/TCP 传回又要数十毫秒，与能省下的约 0.04 s 相当甚至更多；另外常驻进程会在评测时一直占着第二台节点，可以提前读好输入，这已经偏离"让程序本身跑得更快"。所以不实现。
 
 **多机 MPI 不采用。** 这道题单次运行的计算量（单节点 0.08 s）太小，任何跨进程、跨节点的启动和数据回传都比它本身还贵；单节点 64 线程共享内存已是合适的并行粒度。源码没有改动。
+
+## 补充实验：GPU（CUDA + cuFFT）整条计算——不采用（分支 `experiment/cuda`）
+
+用户希望试一下 GPU。先在 prometheus（RTX 5070 Ti Laptop，12 GB，Ryzen 9 8945HX 32 线程，CUDA 13.4）上开发和验证，再到集群的 L40（hepnode2/3 各 2 块，spack 中的 CUDA 13.3.0；12.9.1 不支持 GCC 15）上评估。代码在分支 `experiment/cuda`（提交 `a2fe4ea`），master 未改动。
+
+### 实现
+
+- **float 精度**：消费级和 L40 这类卡的双精度吞吐只有单精度的 1/64，所以 FFT、加窗、功率、Mel 全部用 float。样本是 pcm/32768，转成 float 是精确的。误差余量用量最大 2.9%（narrow_band），与 CPU 的 float 开关相当。
+- **cuFFT 直接读样本**：`cufftPlanMany` 的输入间距设为 hop，相邻帧在原样本数组上重叠读取，不需要逐帧拷贝；Hann 窗在频域施加（与 R5 相同的 `Y[k] = X[k]/2 - (X[k-1]+X[k+1])/4`）。
+- **三个 kernel / chunk**：cuFFT R2C（输出保持自然的 [帧][bin] 布局）→ `window_power`（频域加窗 + 求功率，经 32×32 共享内存 tile 转置成 [bin][帧]）→ `mel_bands`（每线程一帧，按 bin 读取时 warp 内连续，输出 [mel][帧] 也连续）。每个 chunk 8192 帧。
+- **主机侧重叠**：`melspec_cuda.cu` 中一个静态对象在 `main` 之前就启动线程创建 CUDA context 和 4 块 8 MB 的锁页缓冲，与 `main.cpp` 的读文件并行；进入 compute 后，主机线程在等待 context 的同时并行把样本转成 float、清零 output、为 `write_output` 预触页；GPU 就绪后，样本按 chunk 的需要分段上传（独立 stream，与前面 chunk 的计算重叠），结果按 chunk 拷回锁页缓冲，由主机线程并行展宽成 double 写入 output。找不到可用 GPU 时自动走原来的 CPU 路径（prometheus 的 GPU 显存被其他程序占满时实际触发过，4/4 PASS）。
+- **两个踩到的问题**：① 第一版让 cuFFT 直接输出 [bin][帧] 布局（`ostride=chunk`），nsys 显示 FFT 从 19 ms 变成 81 ms，改回自然布局 + 单独的转置 kernel；② 进程退出时如果启动线程还在 CUDA runtime 里，与 runtime 自身的析构竞争，集群上 `MELSPEC_NO_CUDA=1` 的 validate 卡死到作业超时（job 318）。改为禁用时不启动该线程、compute 返回前一定等它结束。
+
+### 结果
+
+**prometheus（GPU 空闲时）**：GPU 部分本身 default 0.072 s、16384 点 0.15 s，而这台笔记本上 MKL 在 AMD CPU 上较慢，CPU 路径的 kernel 为 0.36 / 0.73 s。validate：GPU 0.576 / 0.422 / 0.657 / 0.801 s，对比 CPU 构建 0.571 / 0.440 / 0.985 / 0.931 s，16384 点两组快 15–33%，8192 点两组持平。瓶颈是 CUDA 启动：从进程开始约 0.24 s 才就绪（其中创建 context 0.16–0.22 s），而读文件约 0.08 s 就结束了。
+
+**集群 L40 上 CUDA 启动的固定开销（job 316、318，从进程开始计时）**：
+
+| context 创建 | 耗时 |
+|---|---:|
+| 默认（2 块 GPU 可见，持久模式关闭） | 0.19–0.22 s |
+| `CUDA_VISIBLE_DEVICES=0` | 0.14 s |
+| 另有进程一直打开着 GPU（相当于持久模式） | 0.10 s |
+| 两者都用 | 0.10 s |
+
+此外 cuFFT 建 plan 在集群上每次还要 0.017–0.027 s（偶尔 0.23 s）。GPU 本身很快：全部帧的 8192 点 FFT 只要 9 ms，锁页拷回 26 GB/s，default 的 GPU 计算 + 拷回 + 展宽约 0.013 s。
+
+**validate（job 420，hepnode3，独占，Time 列，s）**：
+
+| | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| 同一构建，禁用 GPU（`MELSPEC_NO_CUDA=1`） | 0.363 | 0.234 | 0.416 | 0.421 |
+| GPU，默认 | 0.578 | 0.474 | 0.676 | 0.662 |
+| GPU，`CUDA_VISIBLE_DEVICES=0` | 0.496 | 0.390 | 0.605 | 0.600 |
+| GPU，`CUDA_VISIBLE_DEVICES=0` + 常驻进程打开 GPU | 0.413 | 0.319 | 0.525 | 0.499 |
+| 参考：master（不链接 CUDA） | 0.275–0.29 | 0.18 | 0.35–0.37 | 0.34–0.36 |
+
+### 结论
+
+在集群上 GPU 在所有配置下都更慢，不采用。原因与 MPI 那节相同：每次运行都是新进程，固定的启动开销比要省的计算还大。集群 CPU 路径的 compute 只有约 0.08 s，而即使用上常驻进程这种接近"持久模式"的做法，context 也要 0.10 s 才就绪，再加 cuFFT 建 plan 的约 0.02 s；只要把 cuFFT/cudart 链接进来，动态库加载就让禁用 GPU 时也慢了约 0.08 s（0.363 vs 0.28 s）。GPU 只有在 CPU 弱、计算量大的机器上（如 prometheus 的 16384 点）才划算。常驻进程的做法即使能更快也不打算用：它相当于在评测前替管理员开启持久模式，超出了优化程序本身的范围。
