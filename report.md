@@ -1206,4 +1206,4 @@ store 在 default 上约占 compute 的 9%。每次写缺失都要先把缓存�
 - **spack 的 libfabric 没有 verbs 等 InfiniBand provider**（`fi_info -l` 只有 udp、tcp、sockets 和若干 hook），MPICH 构建时也加了 `--without-ibverbs`，所以 MPICH 节点间只能走 TCP，用不上 FDR IB。`FI_PROVIDER=verbs` 直接初始化失败。
 - 预先启动的服务进程在默认和 `FI_PROVIDER=tcp` 两种设置下都没能在 10 s 内写出端口文件（srun 作业步被取消），没有继续调试，因为下面的结论不依赖它。
 
-**结论（与第一轮相同，这次覆盖了所有可用节点和三种 MPI）**：每次运行都是新进程，至少要付一次 `MPI_Init`，最快约 0.08 s，与单节点 64 线程的整个 compute（约 0.08 s）相当；而把 compute 分给第二台节点最多只能省约 0.04 s，还要加上经 TCP 传回约 99 MB 结果的时间。即使像 CUDA 那样把 `MPI_Init` 放进 `main` 之前启动的线程、与读文件（约 0.07 s）重叠，Open MPI 5 的单进程模式也不能在没有 PRRTE 的情况下 connect/accept，只能用 MPICH（0.14 s，只有 TCP），仍然划不来。MPI 方向到此为止，源码未改动。
+**结论（与第一轮相同，这次覆盖了所有可用节点和三种 MPI）**：每次运行都是新进程，至少要付一次 `MPI_Init`，最快约 0.08 s，与单节点 64 线程的整个 compute（约 0.08 s）相当；而把 compute 分给第二台节点最多只能省约 0.04 s，还要加上经 TCP 传回约 99 MB 结果的时间。即使像 CUDA 那样把 `MPI_Init` 放进 `main` 之前启动的线程、与读文件（约 0.07 s）重叠，Open MPI 5 的单进程模式据我所知需要 PRRTE 才能 connect/accept（这里没有实测），能用的只剩 MPICH（0.14 s，只有 TCP），仍然划不来。MPI 方向到此为止，源码未改动。
