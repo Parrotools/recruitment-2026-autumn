@@ -14,14 +14,17 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <initializer_list>
 #include <limits>
 #include <new>
 #include <thread>
 #include <vector>
 
+#include <dlfcn.h>
 #include <sched.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace {
@@ -39,6 +42,7 @@ struct alignas(std::max_align_t) AllocationHeader {
     std::uint64_t tag;
     void* mapping_base;
     std::size_t mapping_size;
+    std::size_t requested;  // payload size asked for
 };
 
 static_assert(sizeof(AllocationHeader) % alignof(std::max_align_t) == 0,
@@ -91,7 +95,7 @@ void* malloc_block(std::size_t requested) noexcept {
     }
     void* raw = std::malloc(sizeof(AllocationHeader) + payload);
     if (raw == nullptr) return nullptr;
-    ::new (raw) AllocationHeader{kSmallAllocationTag, nullptr, 0};
+    ::new (raw) AllocationHeader{kSmallAllocationTag, nullptr, 0, requested};
     return reinterpret_cast<unsigned char*>(raw) + sizeof(AllocationHeader);
 }
 
@@ -183,8 +187,33 @@ void touch_mapping(unsigned char* base, std::size_t usable_size,
     }
 }
 
+// Set up before C++ static initialization (see allocator_init).
+bool g_parallel_memset = true;  // MELSPEC_PAR_MEMSET=0 disables
+using MemsetFunction = void* (*)(void*, int, std::size_t);
+MemsetFunction g_libc_memset = nullptr;
+
+// Runs on the main thread before any C++ static constructor (priority 101),
+// so the prefetch thread in melspec.cpp already sees these settings.
+__attribute__((constructor(101))) void allocator_init() {
+    if (const char* text = std::getenv("MELSPEC_PAR_MEMSET"))
+        g_parallel_memset = std::strcmp(text, "0") != 0;
+    g_libc_memset =
+        reinterpret_cast<MemsetFunction>(dlsym(RTLD_NEXT, "memset"));
+}
+
+// Asks the kernel to place the pages of [base, base + size) on `node` when it
+// has free memory there (MPOL_PREFERRED falls back to other nodes otherwise).
+void prefer_node(void* base, std::size_t size, int node) noexcept {
+    if (node < 0 || node >= 64) return;
+    constexpr int kMpolPreferred = 1;
+    const unsigned long mask = 1ul << node;
+    (void)syscall(SYS_mbind, base, size, kMpolPreferred, &mask,
+                  sizeof(mask) * 8 + 1, 0);
+}
+
 void* mapped_block(std::size_t requested,
-                   std::size_t touch_threads = MELSPEC_TOUCH_THREADS) noexcept {
+                   std::size_t touch_threads = MELSPEC_TOUCH_THREADS,
+                   int node = -1) noexcept {
     const std::size_t payload = std::max<std::size_t>(requested, 1);
     constexpr std::size_t kHeaderSize = sizeof(AllocationHeader);
     if (payload > std::numeric_limits<std::size_t>::max() - kHeaderSize) {
@@ -219,32 +248,32 @@ void* mapped_block(std::size_t requested,
         ~(static_cast<std::uintptr_t>(kHugePageAlignment) - 1);
     auto* base = reinterpret_cast<unsigned char*>(aligned_address);
     (void)madvise(base, usable_size, MADV_HUGEPAGE);
+    prefer_node(base, usable_size, node);
     touch_mapping(base, usable_size, touch_threads);
 
     ::new (static_cast<void*>(base))
-        AllocationHeader{kMappedAllocationTag, raw, mapping.size()};
+        AllocationHeader{kMappedAllocationTag, raw, mapping.size(), requested};
     void* user = base + sizeof(AllocationHeader);
     mapping.release();
     return user;
 }
 
-// A pre-faulted mapping parked by melspec_reserve_allocation(), handed to the
-// next big allocation it fits without wasting more than half of it.
-std::atomic<AllocationHeader*> g_reserved{nullptr};
-
-std::size_t mapped_capacity(const AllocationHeader* header) noexcept {
-    return header->mapping_size - kHugePageAlignment - sizeof(AllocationHeader);
-}
+// Pre-faulted mappings parked by melspec_reserve_allocation_on_node(), each
+// handed to the next big allocation of exactly its size. (Sizes must match
+// exactly: reservations are made while main.cpp is still reading, and its
+// 8-byte-per-sample signal vector is about as big as the float copy.)
+constexpr std::size_t kReservationSlots = 4;
+std::atomic<AllocationHeader*> g_reserved[kReservationSlots] = {};
 
 void* take_reserved(std::size_t requested) noexcept {
-    AllocationHeader* header = g_reserved.load(std::memory_order_acquire);
-    if (header == nullptr) return nullptr;
-    const std::size_t capacity = mapped_capacity(header);
-    if (requested > capacity || requested < capacity / 2) return nullptr;
-    if (!g_reserved.compare_exchange_strong(header, nullptr,
-                                            std::memory_order_acq_rel))
-        return nullptr;
-    return header + 1;
+    for (std::atomic<AllocationHeader*>& slot : g_reserved) {
+        AllocationHeader* header = slot.load(std::memory_order_acquire);
+        if (header == nullptr || requested != header->requested) continue;
+        if (slot.compare_exchange_strong(header, nullptr,
+                                         std::memory_order_acq_rel))
+            return header + 1;
+    }
+    return nullptr;
 }
 
 void* allocate_once(std::size_t requested) noexcept {
@@ -258,22 +287,88 @@ void* allocate_once(std::size_t requested) noexcept {
 
 }  // namespace
 
-// Maps and pre-faults, on the calling thread only, a block for a big
-// allocation the caller knows is coming (see compute_melspectrogram), so that
-// allocation later costs neither page faults nor kernel zeroing. Replaces an
-// earlier unused reservation.
-void melspec_reserve_allocation(std::size_t bytes) noexcept {
+// Maps and pre-faults, with touch_threads threads, a block for a big
+// allocation the caller knows is coming (see melspec.cpp), so that allocation
+// later costs neither page faults nor kernel zeroing. With node >= 0 the pages
+// are preferably placed on that NUMA node instead of the touching threads'
+// (the prefetch thread reserves on behalf of the main thread, which writes
+// the blocks). Takes a free slot, else replaces the first one.
+void melspec_reserve_allocation_on_node(std::size_t bytes, int node,
+                                        std::size_t touch_threads) noexcept {
     if (bytes < kBigAllocationThreshold || g_allocator_recursion != 0) return;
     void* user;
     {
         RecursionGuard guard;
-        user = mapped_block(bytes, 1);
+        user = mapped_block(bytes, touch_threads, node);
     }
     if (user == nullptr) return;
     auto* header = static_cast<AllocationHeader*>(user) - 1;
+    for (std::atomic<AllocationHeader*>& slot : g_reserved) {
+        AllocationHeader* empty = nullptr;
+        if (slot.compare_exchange_strong(empty, header,
+                                         std::memory_order_acq_rel))
+            return;
+    }
     if (AllocationHeader* old =
-            g_reserved.exchange(header, std::memory_order_acq_rel))
+            g_reserved[0].exchange(header, std::memory_order_acq_rel))
         (void)munmap(old->mapping_base, old->mapping_size);
+}
+
+// memset of 32 MiB or more (main.cpp's vector value-initialization zeroes
+// the 197 MB signal and float copy this way) is split over 16 threads unless
+// MELSPEC_PAR_MEMSET=0; everything else goes to the C library's memset.
+// Measured 7-17 ms faster end to end (report, round 8).
+extern "C" void* memset(void* destination, int value,
+                        std::size_t size) noexcept {
+    constexpr std::size_t kParallelMemset = std::size_t{32} << 20;
+    if (g_libc_memset == nullptr) {
+        // Before allocator_init (other libraries' start-up code): bytewise,
+        // through volatile so this loop is not turned back into memset.
+        auto* bytes = static_cast<volatile unsigned char*>(destination);
+        for (std::size_t i = 0; i < size; ++i)
+            bytes[i] = static_cast<unsigned char>(value);
+        return destination;
+    }
+    if (!g_parallel_memset || size < kParallelMemset ||
+        g_allocator_recursion != 0)
+        return g_libc_memset(destination, value, size);
+
+    RecursionGuard guard;
+    auto* bytes = static_cast<unsigned char*>(destination);
+    const std::size_t workers = std::min<std::size_t>(
+        {16, allocator_usable_cpus(), allocator_thread_limit()});
+    if (workers <= 1) return g_libc_memset(destination, value, size);
+    // Split on 4 KiB boundaries so no two threads share a page.
+    const std::size_t pages = size / 4096;
+    std::vector<std::thread> helpers;
+    std::size_t started = 0;
+    try {
+        helpers.reserve(workers);
+        for (std::size_t worker = 1; worker < workers; ++worker) {
+            const std::size_t first =
+                split_start(pages, worker, workers) * 4096;
+            const std::size_t end =
+                worker + 1 == workers
+                    ? size
+                    : split_start(pages, worker + 1, workers) * 4096;
+            helpers.emplace_back([=] {
+                RecursionGuard inner;
+                g_libc_memset(bytes + first, value, end - first);
+            });
+            started = worker;
+        }
+    } catch (...) {
+    }
+    // The calling thread takes part 0 plus whatever was not handed out.
+    const std::size_t own_end = split_start(pages, 1, workers) * 4096;
+    g_libc_memset(bytes, value, own_end);
+    if (started + 1 < workers) {
+        const std::size_t rest =
+            split_start(pages, started + 1, workers) * 4096;
+        g_libc_memset(bytes + rest, value, size - rest);
+    }
+    for (std::thread& helper : helpers) helper.join();
+    return destination;
 }
 
 void* operator new(std::size_t requested) {

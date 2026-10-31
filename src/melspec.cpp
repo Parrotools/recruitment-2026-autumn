@@ -42,8 +42,8 @@
 #if defined(__linux__) && defined(MELSPEC_HUGE_ALLOC) && MELSPEC_HUGE_ALLOC
 // Defined in large_alloc.cpp; weak so builds without the allocator (such as
 // the unit test) link, with the address then being null.
-__attribute__((weak)) void melspec_reserve_allocation(
-    std::size_t bytes) noexcept;
+__attribute__((weak)) void melspec_reserve_allocation_on_node(
+    std::size_t bytes, int node, std::size_t touch_threads) noexcept;
 #define MELSPEC_HAS_RESERVE 1
 #else
 #define MELSPEC_HAS_RESERVE 0
@@ -393,8 +393,10 @@ void run_workers(std::size_t workers, Body&& body) {
 #ifndef MELSPEC_MKL_BATCH
 #define MELSPEC_MKL_BATCH 1
 #endif
+// Single-precision FFT and power (the Mel sums stay double): uses at most a
+// few percent of the validation tolerance, see the report.
 #ifndef MELSPEC_FFT_FLOAT
-#define MELSPEC_FFT_FLOAT 0
+#define MELSPEC_FFT_FLOAT 1
 #endif
 #ifndef MELSPEC_FREQ_WINDOW
 #define MELSPEC_FREQ_WINDOW 1
@@ -512,12 +514,19 @@ void frequency_window_power(const DftiPlan<Real>& plan, const Real* frame,
 // Worker 1 (worker 0 if alone) runs it while the others already compute tiles,
 // which they keep in a private stash until the output is ready, so the
 // single-threaded zero fill of the output overlaps with the FFT work.
+//
+// reserve_node is the NUMA node for the float copy reservation (-1: the
+// calling thread's). Workers stop claiming tiles once *cancel is set. With
+// `available`, samples are still being read: a tile starts only once the
+// samples before *available cover it.
 template <typename Real, typename PrepareOutput>
 void compute_with_mkl(const double* samples, std::size_t n_frames,
                       std::size_t fft_size, std::size_t hop,
                       const MelWeights& mel, const std::vector<double>& window,
                       std::size_t requested_threads,
-                      PrepareOutput&& prepare_output, bool trace) {
+                      PrepareOutput&& prepare_output, bool trace,
+                      int reserve_node, const std::atomic<bool>* cancel,
+                      const std::atomic<std::size_t>* available) {
     const std::size_t n_bins = fft_size / 2 + 1;
     std::size_t active_first = n_bins;
     std::size_t active_end = 0;
@@ -563,8 +572,11 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
     const std::size_t preparer = workers > 1 ? 1 : 0;
     const auto reserve_float_copy = [&] {
 #if MELSPEC_HAS_RESERVE
-        if (melspec_reserve_allocation != nullptr)
-            melspec_reserve_allocation(mel_count * n_frames * sizeof(float));
+        if (melspec_reserve_allocation_on_node != nullptr)
+            melspec_reserve_allocation_on_node(
+                mel_count * n_frames * sizeof(float), reserve_node, 1);
+#else
+        (void)reserve_node;
 #endif
     };
     run_workers(workers, [&](std::size_t worker) {
@@ -688,8 +700,20 @@ void compute_with_mkl(const double* samples, std::size_t n_frames,
                 next_claim.fetch_add(1, std::memory_order_relaxed);
             lap(5);
             if (claim >= claims) break;
+            if (cancel != nullptr && cancel->load(std::memory_order_relaxed))
+                break;
             const std::size_t tile_end =
                 std::min(tiles, (claim + 1) * kTilesPerClaim);
+            if (available != nullptr) {
+                const std::size_t last_frame =
+                    std::min(n_frames, tile_end * kTileFrames) - 1;
+                const std::size_t needed = last_frame * hop + fft_size;
+                while (available->load(std::memory_order_acquire) < needed) {
+                    if (cancel->load(std::memory_order_relaxed)) break;
+                    std::this_thread::yield();
+                }
+                if (cancel->load(std::memory_order_relaxed)) break;
+            }
             for (std::size_t tile = claim * kTilesPerClaim; tile < tile_end;
                  ++tile) {
                 const std::size_t frame0 = tile * kTileFrames;
@@ -856,17 +880,22 @@ std::vector<std::vector<double>> build_mel_filterbank(int sr, int n_fft,
     return dense;
 }
 
-void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
-                            int hop_length, int n_mels, double f_min,
-                            double f_max, std::vector<double>& output) {
+// The body of compute_melspectrogram on n_samples samples, which must not
+// live in `output`. reserve_node, cancel and available (samples still being
+// read; requires cancel) are passed to compute_with_mkl.
+static void compute_core(const double* input_samples, std::size_t n_samples,
+                         int sr, int n_fft, int hop_length, int n_mels,
+                         double f_min, double f_max,
+                         std::vector<double>& output, int reserve_node,
+                         const std::atomic<bool>* cancel,
+                         const std::atomic<std::size_t>* available) {
     StageTrace trace;
     validate_mel_parameters(sr, n_fft, n_mels, f_min, f_max);
     if (hop_length <= 0)
         throw std::invalid_argument("hop_length must be positive");
-    if (y.size() < static_cast<std::size_t>(n_fft))
+    if (n_samples < static_cast<std::size_t>(n_fft))
         throw std::runtime_error("Audio too short for given n_fft");
 
-    const std::size_t n_samples = y.size();
     const std::size_t fft_size = static_cast<std::size_t>(n_fft);
     const std::size_t hop = static_cast<std::size_t>(hop_length);
     const std::size_t n_frames = 1 + (n_samples - fft_size) / hop;
@@ -878,17 +907,6 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
     const std::size_t requested_threads = parse_requested_threads();
     const MelWeights mel =
         make_compact_mel_weights(sr, n_fft, n_mels, f_min, f_max);
-
-    // Preserve the input before resize if callers intentionally reuse one
-    // vector for both input and output. The ordinary out-of-place path does
-    // not copy the signal.
-    std::vector<double> alias_input;
-    const std::vector<double>* input = &y;
-    if (&y == &output) {
-        alias_input = y;
-        input = &alias_input;
-    }
-    const double* input_samples = input->data();
 
     std::vector<double> window(fft_size);
     for (std::size_t i = 0; i < fft_size; ++i) {
@@ -908,11 +926,20 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                 output.resize(output_count);
                 return output.data();
             },
-            trace.enabled());
+            trace.enabled(), reserve_node, cancel, available);
         trace.mark("kernel");
         return;
     }
+#else
+    (void)reserve_node;
 #endif
+    // The hand-written path needs every sample from the start.
+    if (available != nullptr) {
+        while (available->load(std::memory_order_acquire) < n_samples) {
+            if (cancel->load(std::memory_order_relaxed)) return;
+            std::this_thread::yield();
+        }
+    }
 
     // The periodic Hann window of length one is exactly zero.
     if (n_fft == 1) {
@@ -1258,4 +1285,438 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
         }
         if (!ready) become_ready(true);
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Prefetch: compute while main.cpp is still reading
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// main.cpp reads and converts the whole input (about 0.07 s for the test
+// data) before it calls compute_melspectrogram, so the 64 cores sit idle for
+// that time. A static object here parses the process's command line exactly
+// like main.cpp's parse_args, then reads the input itself on a background
+// thread and computes the spectrogram into a private vector. When
+// compute_melspectrogram is called, it takes that result only if every
+// parameter is identical and the samples it was handed are bit for bit the
+// ones the background thread read; anything else (or any failure in the
+// background) falls back to the ordinary computation. Set
+// MELSPEC_PREFETCH=0 to disable.
+
+#ifndef MELSPEC_PREFETCH
+#if defined(__linux__)
+#define MELSPEC_PREFETCH 1
+#else
+#define MELSPEC_PREFETCH 0
+#endif
+#endif
+
+#if MELSPEC_PREFETCH
+#include <condition_variable>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <memory>
+#include <mutex>
+#include <string>
+
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+namespace {
+
+class Prefetch {
+   public:
+    Prefetch() noexcept {
+        try {
+            start();
+        } catch (...) {
+            active_ = false;
+        }
+    }
+    ~Prefetch() {
+        cancel_.store(true, std::memory_order_relaxed);
+        if (leader_.joinable()) leader_.join();
+        // Static destruction runs after main returns: what is left of the
+        // wall time from here is process teardown.
+        if (started_ != Clock::time_point{} &&
+            std::getenv("MELSPEC_TRACE") != nullptr)
+            std::fprintf(
+                stderr, "trace prefetch exit %.4f\n",
+                std::chrono::duration<double>(Clock::now() - started_).count());
+    }
+    Prefetch(const Prefetch&) = delete;
+    Prefetch& operator=(const Prefetch&) = delete;
+
+    // Moves the background result into `output` if it was computed from
+    // exactly these arguments; false (with nothing changed) otherwise.
+    bool take(const std::vector<double>& y, int sr, int n_fft, int hop_length,
+              int n_mels, double f_min, double f_max,
+              std::vector<double>& output) {
+        if (measure_only_) {
+            measure_only_ = false;
+            std::fprintf(
+                stderr, "trace prefetch off called %.4f\n",
+                std::chrono::duration<double>(Clock::now() - started_).count());
+        }
+        if (!active_) return false;
+        active_ = false;  // one use only
+        const bool same_parameters = sr == sr_ && n_fft == n_fft_ &&
+                                     hop_length == hop_ && n_mels == n_mels_ &&
+                                     f_min == f_min_ && f_max == f_max_ &&
+                                     &y != &output;
+        bool usable = false;
+        if (same_parameters) {
+            std::unique_lock<std::mutex> lock(mutex_);
+            ready_.wait(lock, [&] { return samples_state_ != kPending; });
+            usable = samples_state_ == kReady;
+        }
+        const auto arrived = Clock::now();
+        if (usable) usable = y.size() == n_samples_ && same_samples(y.data());
+        const auto verified = Clock::now();
+        if (!usable) cancel_.store(true, std::memory_order_relaxed);
+        leader_.join();
+        if (std::getenv("MELSPEC_TRACE") != nullptr) {
+            const auto since = [&](Clock::time_point t) {
+                return std::chrono::duration<double>(t - started_).count();
+            };
+            std::fprintf(stderr,
+                         "trace prefetch samples %.4f computed %.4f called "
+                         "%.4f verified %.4f joined %.4f used %d\n",
+                         since(samples_at_), since(computed_at_),
+                         since(arrived), since(verified), since(Clock::now()),
+                         usable && computed_ ? 1 : 0);
+        }
+        if (!usable || !computed_) return false;
+        output = std::move(result_);
+        return true;
+    }
+
+   private:
+    using Clock = std::chrono::steady_clock;
+    enum : int { kPending, kReady, kFailed };
+
+    void start() {
+        const char* enabled = std::getenv("MELSPEC_PREFETCH");
+        if (enabled != nullptr && std::strcmp(enabled, "0") == 0) return;
+        // MELSPEC_PREFETCH=2 (with MELSPEC_TRACE): no prefetch, only report
+        // when main.cpp calls compute_melspectrogram.
+        if (enabled != nullptr && std::strcmp(enabled, "2") == 0) {
+            started_ = Clock::now();
+            measure_only_ = std::getenv("MELSPEC_TRACE") != nullptr;
+            return;
+        }
+        if (!parse_command_line()) return;
+        if (const char* nice = std::getenv("MELSPEC_PREFETCH_NICE"))
+            nice_ = std::atoi(nice);
+        unsigned cpu = 0, node = 0;
+        if (syscall(SYS_getcpu, &cpu, &node, nullptr) == 0)
+            main_node_ = static_cast<int>(node);
+        started_ = Clock::now();
+        check_will_write();
+        if (will_write_) reserve(input_samples_ * sizeof(int16_t));
+        leader_ = std::thread([this] { run(); });
+        active_ = true;
+    }
+
+    // Whether main.cpp will get as far as writing the output: the input is a
+    // regular file and compute_melspectrogram accepts the parameters. Only
+    // then are main.cpp's allocations reserved and the output truncated
+    // early.
+    void check_will_write() {
+        struct stat info;
+        if (stat(input_.c_str(), &info) != 0 || !S_ISREG(info.st_mode) ||
+            info.st_size <= 0)
+            return;
+        const auto samples = static_cast<std::size_t>(info.st_size) / 2;
+        // main.cpp counts samples in an int.
+        if (samples > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            return;
+        try {
+            validate_mel_parameters(sr_, n_fft_, n_mels_, f_min_, f_max_);
+        } catch (...) {
+            return;
+        }
+        if (hop_ <= 0 || samples < static_cast<std::size_t>(n_fft_)) return;
+        input_samples_ = samples;
+        will_write_ = true;
+    }
+
+    // Pre-faults, on the main thread's NUMA node, a block for one of
+    // main.cpp's big allocations (see melspec_reserve_allocation_on_node).
+    void reserve(std::size_t bytes) const {
+#if MELSPEC_HAS_RESERVE
+        if (melspec_reserve_allocation_on_node != nullptr)
+            melspec_reserve_allocation_on_node(bytes, main_node_, 16);
+#else
+        (void)bytes;
+#endif
+    }
+
+    // main.cpp opens the output with O_TRUNC, which for a file left by an
+    // earlier run (validate.py reuses one temporary file) frees its pages:
+    // about 20 ms for the test output. Doing that truncation here, before
+    // compute_melspectrogram returns and so before main.cpp opens the file,
+    // leaves the same final file. Only an existing regular file is touched.
+    void truncate_output() const {
+        const char* enabled = std::getenv("MELSPEC_PREFETCH_TRUNCATE");
+        if (enabled != nullptr && std::strcmp(enabled, "0") == 0) return;
+        const int fd = open(output_.c_str(), O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+        if (fd < 0) return;
+        struct stat info;
+        if (fstat(fd, &info) == 0 && S_ISREG(info.st_mode) && info.st_size > 0)
+            (void)ftruncate(fd, 0);
+        close(fd);
+    }
+
+    // Mirrors parse_args in main.cpp; gives up wherever main.cpp would exit,
+    // print help or throw.
+    bool parse_command_line() {
+        std::ifstream file("/proc/self/cmdline", std::ios::binary);
+        if (!file) return false;
+        const std::string text((std::istreambuf_iterator<char>(file)),
+                               std::istreambuf_iterator<char>());
+        std::vector<std::string> argv;
+        for (std::size_t begin = 0; begin < text.size();) {
+            std::size_t end = text.find('\0', begin);
+            if (end == std::string::npos) end = text.size();
+            argv.emplace_back(text, begin, end - begin);
+            begin = end + 1;
+        }
+        if (argv.size() < 3) return false;
+        input_ = argv[1];
+        output_ = argv[2];
+        for (std::size_t i = 3; i < argv.size(); ++i) {
+            const std::string& key = argv[i];
+            if (key == "--help" || key == "-h" || i + 1 >= argv.size())
+                return false;
+            const std::string& val = argv[++i];
+            if (key == "--sr")
+                sr_ = std::stoi(val);
+            else if (key == "--n_fft")
+                n_fft_ = std::stoi(val);
+            else if (key == "--hop_length")
+                hop_ = std::stoi(val);
+            else if (key == "--n_mels")
+                n_mels_ = std::stoi(val);
+            else if (key == "--f_min")
+                f_min_ = std::stod(val);
+            else if (key == "--f_max")
+                f_max_ = std::stod(val);
+            else
+                return false;
+        }
+        return true;
+    }
+
+    void set_samples_state(int state) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            samples_state_ = state;
+        }
+        ready_.notify_all();
+    }
+
+    // Compares the caller's samples with ours on several threads (a single
+    // thread measured about 38 ms for the test data).
+    bool same_samples(const double* y) const {
+        constexpr std::size_t kChunk = std::size_t{1} << 18;
+        const std::size_t chunks = (n_samples_ + kChunk - 1) / kChunk;
+        std::atomic<std::size_t> next_chunk{0};
+        std::atomic<bool> differ{false};
+        try {
+            run_workers(worker_count_for(chunks, 32), [&](std::size_t) {
+                for (;;) {
+                    const std::size_t chunk =
+                        next_chunk.fetch_add(1, std::memory_order_relaxed);
+                    if (chunk >= chunks ||
+                        differ.load(std::memory_order_relaxed))
+                        return;
+                    const std::size_t first = chunk * kChunk;
+                    const std::size_t count =
+                        std::min(kChunk, n_samples_ - first);
+                    if (std::memcmp(y + first, samples_.get() + first,
+                                    count * sizeof(double)) != 0)
+                        differ.store(true, std::memory_order_relaxed);
+                }
+            });
+        } catch (...) {
+            return false;
+        }
+        return !differ.load();
+    }
+
+    // Reading and computing overlap: readers publish the length of the
+    // contiguous prefix of converted samples in available_, and each tile
+    // waits only for the samples it needs.
+    void run() {
+        // Threads inherit the niceness of the thread that creates them, so
+        // this lowers every background thread below main.cpp's.
+        if (nice_ > 0)
+            (void)setpriority(PRIO_PROCESS,
+                              static_cast<id_t>(syscall(SYS_gettid)), nice_);
+        std::thread reader;
+        try {
+            open_input();
+            reader = std::thread([this] {
+                const bool ok = read_samples();
+                samples_at_ = Clock::now();
+                if (!ok) cancel_.store(true, std::memory_order_relaxed);
+                set_samples_state(ok ? kReady : kFailed);
+                // Joined (through the leader) before compute_melspectrogram
+                // returns, so this is done before main.cpp opens the file.
+                if (ok && will_write_ && n_samples_ == input_samples_)
+                    truncate_output();
+            });
+        } catch (...) {
+            samples_at_ = Clock::now();
+            set_samples_state(kFailed);
+            return;
+        }
+        // main.cpp's signal vector; after samples_, which has the same size.
+        if (will_write_ && n_samples_ == input_samples_)
+            reserve(n_samples_ * sizeof(double));
+        try {
+            compute_core(samples_.get(), n_samples_, sr_, n_fft_, hop_, n_mels_,
+                         f_min_, f_max_, result_, main_node_, &cancel_,
+                         &available_);
+            computed_ = !cancel_.load(std::memory_order_relaxed);
+        } catch (...) {
+            computed_ = false;
+        }
+        reader.join();
+        computed_at_ = Clock::now();
+    }
+
+    void open_input() {
+        fd_ = open(input_.c_str(), O_RDONLY | O_CLOEXEC);
+        if (fd_ < 0) throw std::runtime_error("prefetch: cannot open input");
+        struct stat info;
+        if (fstat(fd_, &info) != 0 || info.st_size < 0)
+            throw std::runtime_error("prefetch: cannot stat input");
+        n_samples_ = static_cast<std::size_t>(info.st_size) / sizeof(int16_t);
+        if (n_samples_ == 0) throw std::runtime_error("prefetch: empty input");
+        samples_.reset(new double[n_samples_]);
+    }
+
+    // Reads the int16 samples with several threads, in ascending pieces, and
+    // converts them as main.cpp's read_pcm does (pcm / 32768.0, exact in
+    // double). Returns false on a read error.
+    bool read_samples() {
+        constexpr std::size_t kPiece = std::size_t{1} << 15;
+        const std::size_t pieces = (n_samples_ + kPiece - 1) / kPiece;
+        constexpr std::size_t kReaders = 16;  // 2-16 measured the same
+        std::unique_ptr<std::atomic<bool>[]> done(
+            new std::atomic<bool>[pieces]);
+        for (std::size_t i = 0; i < pieces; ++i) done[i] = false;
+        std::size_t prefix_pieces = 0;  // guarded by progress
+        std::mutex progress;
+        std::atomic<std::size_t> next_piece{0};
+        std::atomic<bool> failed{false};
+        double* samples = samples_.get();
+        try {
+            run_workers(worker_count_for(pieces, kReaders), [&](std::size_t) {
+                std::vector<int16_t> buffer(kPiece);
+                for (;;) {
+                    const std::size_t piece =
+                        next_piece.fetch_add(1, std::memory_order_relaxed);
+                    if (piece >= pieces ||
+                        failed.load(std::memory_order_relaxed))
+                        return;
+                    const std::size_t first = piece * kPiece;
+                    const std::size_t count =
+                        std::min(kPiece, n_samples_ - first);
+                    const std::size_t bytes = count * sizeof(int16_t);
+                    std::size_t got_bytes = 0;
+                    while (got_bytes < bytes) {
+                        const ssize_t got = pread(
+                            fd_,
+                            reinterpret_cast<char*>(buffer.data()) + got_bytes,
+                            bytes - got_bytes,
+                            static_cast<off_t>(first * sizeof(int16_t) +
+                                               got_bytes));
+                        if (got <= 0) {
+                            failed.store(true, std::memory_order_relaxed);
+                            return;
+                        }
+                        got_bytes += static_cast<std::size_t>(got);
+                    }
+                    for (std::size_t i = 0; i < count; ++i)
+                        samples[first + i] =
+                            static_cast<double>(buffer[i]) / 32768.0;
+                    // release/acquire on done[] and available_ order these
+                    // sample writes before any tile that reads them.
+                    done[piece].store(true, std::memory_order_release);
+                    std::lock_guard<std::mutex> lock(progress);
+                    while (prefix_pieces < pieces &&
+                           done[prefix_pieces].load(std::memory_order_acquire))
+                        ++prefix_pieces;
+                    available_.store(
+                        std::min(n_samples_, prefix_pieces * kPiece),
+                        std::memory_order_release);
+                }
+            });
+        } catch (...) {
+            failed.store(true);
+        }
+        close(fd_);
+        fd_ = -1;
+        return !failed.load();
+    }
+
+    bool active_ = false;
+    std::string input_;
+    std::string output_;
+    bool will_write_ = false;
+    std::size_t input_samples_ = 0;
+    int sr_ = 44100;
+    int n_fft_ = 2048;
+    int hop_ = 512;
+    int n_mels_ = 128;
+    double f_min_ = 0.0;
+    double f_max_ = 22050.0;
+    int main_node_ = -1;
+    int nice_ = 10;  // MELSPEC_PREFETCH_NICE; measured slightly faster
+    bool measure_only_ = false;
+
+    std::thread leader_;
+    std::atomic<bool> cancel_{false};
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    int samples_state_ = kPending;  // guarded by mutex_
+    int fd_ = -1;
+    std::unique_ptr<double[]> samples_;
+    std::size_t n_samples_ = 0;
+    std::atomic<std::size_t> available_{0};
+    // Written by the leader thread, read after joining it.
+    std::vector<double> result_;
+    bool computed_ = false;
+    Clock::time_point started_, samples_at_, computed_at_;
+};
+
+Prefetch g_prefetch;
+
+}  // namespace
+#endif  // MELSPEC_PREFETCH
+
+void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
+                            int hop_length, int n_mels, double f_min,
+                            double f_max, std::vector<double>& output) {
+#if MELSPEC_PREFETCH
+    if (g_prefetch.take(y, sr, n_fft, hop_length, n_mels, f_min, f_max, output))
+        return;
+#endif
+    // Preserve the input before resize if callers intentionally reuse one
+    // vector for both input and output. The ordinary out-of-place path does
+    // not copy the signal.
+    std::vector<double> alias_input;
+    const std::vector<double>* input = &y;
+    if (&y == &output) {
+        alias_input = y;
+        input = &alias_input;
+    }
+    compute_core(input->data(), input->size(), sr, n_fft, hop_length, n_mels,
+                 f_min, f_max, output, -1, nullptr, nullptr);
 }

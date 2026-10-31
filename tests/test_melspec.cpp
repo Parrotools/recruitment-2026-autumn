@@ -48,8 +48,18 @@ void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+#if defined(MELSPEC_MKL) && MELSPEC_MKL && \
+    (!defined(MELSPEC_FFT_FLOAT) || MELSPEC_FFT_FLOAT)
+// Single-precision FFT (the MKL default): the validator's tolerance.
+constexpr bool kFloatFft = true;
+#else
+constexpr bool kFloatFft = false;
+#endif
+
 void require_close(double actual, double expected, const std::string& label) {
-    const double tolerance = 2e-9 * std::max(1.0, std::abs(expected));
+    const double tolerance = kFloatFft
+                                 ? 1e-4 + 1e-3 * std::abs(expected)
+                                 : 2e-9 * std::max(1.0, std::abs(expected));
     if (!std::isfinite(actual) || std::abs(actual - expected) > tolerance) {
         throw std::runtime_error(label + ": actual=" + std::to_string(actual) +
                                  " expected=" + std::to_string(expected));
