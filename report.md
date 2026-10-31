@@ -11,6 +11,7 @@
 | R4 | 用满 64 核；MKL DFTI 单帧 r2c（检测到 MKL 时默认启用，静态顺序链接）；原子计数器动态 tile 调度；行布局 power + `[mel][16]` tile 输出；输出清零与计算重叠；`write_output` 的 float 副本在 compute 中预触页。`HUGE_ALLOC`、`-march=native` 在 Linux 默认开启。 | 集群 hepnode3 独占 64 核（job 207），`validate.py --runs 5` 两轮四组全部 PASS，误差与 R2 逐位相同。default/small_mels/large_fft/narrow_band 为 **0.307/0.188/0.403/0.384 s**（R2 B_huge 同条件 0.370/0.226/0.450/0.442 s）。详见文末“第四轮”。 |
 | **R5 当前默认** | 在 R4 基础上：周期 Hann 窗移到频域，DFTI out-of-place 直接读输入样本，`Y[k] = X[k]/2 - (X[k-1]+X[k+1])/4` 只在活跃 bin 上计算（开关 `MELSPEC_FREQ_WINDOW`，默认 1）；Mel 点积 4 帧一组累加（结果逐位不变）；`output` 的 resize 改由 worker 1 执行，与主线程预留 float 副本并行。绑核、NUMA 本地输出、分配器偏好本地节点、PERM 打包格式、两帧合并复数 FFT 等尝试均未采用（见第五轮）。 | job 235 独占 64 核，`validate --runs 5` 三轮四组全部 PASS，误差与 R4 逐位相同：default **0.284–0.287 s**、small_mels **0.179–0.183 s**、large_fft **0.359–0.368 s**、narrow_band **0.347–0.355 s**（R4 最终验收 job 207：0.307 / 0.188 / 0.403 / 0.384 s）。 |
 | R6 / **R7** | R6：全 worker 分阶段插桩（`MELSPEC_TRACE=1`）；8 帧 Mel、DFTI 不用工作区、两级创建线程、共享描述符、tile 形状、`main.cpp` 编译选项都在满载下测过，均未采用。R7：没有 MKL 时的回退路径改为动态领取 + `[mel][32]` tile 输出 + resize 与计算重叠，并默认开启 R3 的 `FUSED_FFT`（逐字节不变，快 17–23%）。 | 默认（MKL）构建的输出与 R5 逐字节相同、性能不变。回退路径（`MKL=0`）validate default/small_mels/large_fft/narrow_band 从 0.35/0.23/0.45/0.46 s 降到 **0.305–0.314/0.190–0.193/0.379–0.396/0.368–0.380 s**（job 256，含 FUSED_FFT），输出逐字节不变。 |
+| **R8 当前默认** | 加速比改以 melspec.py 为基准（job 533：17.305/17.163/32.422/32.676 s）。float FFT 默认开启；`main` 读文件期间由后台线程提前读入并计算，调用时逐字节校验输入后 move 结果（`MELSPEC_PREFETCH`）；≥32 MiB 的 memset 16 线程并行（`MELSPEC_PAR_MEMSET`）；后台线程 nice 10。详见文末"第八轮"。 | job 551 独占 64 核，`make test` 与三轮 validate 全部 PASS：default **0.223–0.242 s**、small_mels **0.115–0.120 s**、large_fft **0.254–0.269 s**、narrow_band **0.244–0.251 s**，相对 melspec.py **77.6/149.2/127.6/133.9 倍**（两边都取最小值）。double 构建与 master 逐字节相同。 |
 
 第五轮之后，默认构建（`make`）就是上表 R5 行的配置：在集群上 Makefile 自动找到 spack 中的 oneMKL 并启用 MKL 路径，同时默认开启 `HUGE_ALLOC=1`（Linux）和 `-march=native`；没有 MKL 的机器自动退回 R1–R3 的手写 FFT 路径。R3 的 `FUSED_FFT`/`AVX512` 仍是默认关闭的实验开关，只作用于手写路径。float32 FFT（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=1`）能再快 10–25%，但不是默认，原因见第四轮结论。下文第一到第三轮按当时的状态记录，其中“默认关闭 HUGE_ALLOC”等表述指的是当时的构建默认值。
 
@@ -1207,3 +1208,161 @@ store 在 default 上约占 compute 的 9%。每次写缺失都要先把缓存�
 - 预先启动的服务进程在默认和 `FI_PROVIDER=tcp` 两种设置下都没能在 10 s 内写出端口文件（srun 作业步被取消），没有继续调试，因为下面的结论不依赖它。
 
 **结论（与第一轮相同，这次覆盖了所有可用节点和三种 MPI）**：每次运行都是新进程，至少要付一次 `MPI_Init`，最快约 0.08 s，与单节点 64 线程的整个 compute（约 0.08 s）相当；而把 compute 分给第二台节点最多只能省约 0.04 s，还要加上经 TCP 传回约 99 MB 结果的时间。即使像 CUDA 那样把 `MPI_Init` 放进 `main` 之前启动的线程、与读文件（约 0.07 s）重叠，Open MPI 5 的单进程模式据我所知需要 PRRTE 才能 connect/accept（这里没有实测），能用的只剩 MPICH（0.14 s，只有 TCP），仍然划不来。MPI 方向到此为止，源码未改动。
+
+## 第八轮：以 melspec.py 为基准；float FFT 默认开启、读文件期间提前计算、并行 memset（2026-10-31）
+
+用户要求继续优化，加速比改为以 `melspec.py`（NumPy/SciPy 参考实现）为基准计算；并告知 float32 FFT 的精度可以接受。集群实验目录：`~/workspace/melspec-optimization-20261029/round8/`（`jobs/`、`results/`、`build/`）。
+
+### 基准：melspec.py 的时间
+
+计算节点的 venv 里没有 scipy，集群也没有 pip，于是在本地下载 `scipy-1.18.1` 的 cp314 manylinux wheel，传到集群解压到 `round8/pylib`，用 `PYTHONPATH` 加载（numpy 用 venv 里已有的 2.5.4）。`melspec.py` 未作任何改动。
+
+- job 533（hepnode1，独占 64 核）：`validate.py melspec.py --runs 3`，Time 列（3 次取最小）**default 17.305 s、small_mels 17.163 s、large_fft 32.422 s、narrow_band 32.676 s**，4/4 PASS。整个 validate 的峰值内存 68 GB（`melspec.py` 一次性生成全部加窗帧）。scipy 的 `rfft` 默认单线程。
+- job 546（hepnode1）：同样的方式逐次计时（`jobs/pyruns.py`，每个用例 3 次，全部列出）：default 17.729 / 17.502 / 17.491，small_mels 17.015 / 23.095 / 17.491，large_fft 35.776 / 32.998 / 33.260，narrow_band 33.564 / 33.198 / 32.813 s。small_mels 的 23.095 s 明显是一次偶发抖动。
+- 同一作业中 master（提交 `145394f`）为 0.300 / 0.187 / 0.357 / 0.356 s，即相对 melspec.py 58 / 92 / 91 / 92 倍。
+
+### 改动 1：float FFT 改为默认
+
+`MELSPEC_FFT_FLOAT` 默认值改为 1（第四、七轮已实现并验证：FFT 和功率用 float，Mel 累加仍是 double，误差最多用到容差的几个百分点）。validate 的 Max Abs Err 从 3.12e-02 / 1.17e-02 / 1.25e-01 / 6.25e-02 变为 4.69e-02 / 1.56e-02 / 1.25e-01 / 1.25e-01，全部 PASS。单元测试原来对 Mel 输出用 2e-9 的相对容差（按 double 定的），float 构建下改用与 validate 相同的 `atol=1e-4, rtol=1e-3`；double 构建（`CPPFLAGS=-DMELSPEC_FFT_FLOAT=0`）仍用 2e-9。
+
+### 改动 2：在 main.cpp 读文件的同时提前计算（`MELSPEC_PREFETCH`，Linux 默认开启）
+
+**动机。** 64 核时 default 约 0.28 s 中，`main.cpp` 读入约 0.06–0.08 s，这段时间 64 个核全部空闲；compute 必须等它返回才开始。
+
+**做法（`src/melspec.cpp` 末尾的 `Prefetch`）。**
+
+1. 一个静态对象在 `main` 之前运行：读 `/proc/self/cmdline`，按与 `main.cpp` 的 `parse_args` 完全相同的规则解析参数（同样用 `std::stoi`/`std::stod`）；遇到 `--help`、缺值、未知参数或解析异常，即任何 `main.cpp` 会退出、打印帮助或抛异常的情况，就不启用。
+2. 启用时起一个后台线程：`open`/`fstat` 输入文件，16 个线程用 `pread` 按 32768 个样本一块、升序领取，按 `read_pcm` 的方式转成 double（`pcm / 32768.0`，在 double 中是精确的）。
+3. **边读边算**：读线程用 release/acquire 发布"已转换好的连续前缀长度"，计算线程领到一个 tile 后，只等待这个 tile 需要的样本，不必等整个文件读完。读失败时设置取消标志，等待中的线程会退出，不会卡死。
+4. 计算本身就是原来的 compute（抽成内部函数 `compute_core`，输入改为指针加长度，增加取消标志和"已就绪样本数"两个参数），结果放进后台自己的 `std::vector<double>`。
+5. `main.cpp` 调用 `compute_melspectrogram` 时：参数必须逐个相等（double 用 `==`），`y` 与 `output` 不能是同一个对象，`y.size()` 必须等于后台读到的样本数，并且 `y` 的内容与后台读到的样本**逐字节相同**（32 个线程分块 `memcmp`）。全部满足时 `output = std::move(结果)`：O(1)，连 394 MB 的 resize 清零也省掉了。任何一项不满足，或后台出错，就取消后台并走原来的计算路径，所以结果和异常行为都与不预取时一致。
+6. 后台线程降低优先级（`setpriority` nice 10，新建线程会继承），让 `main.cpp` 的读路径优先。
+7. 后台替主线程为 `write_output` 的 float 副本预触页时，页面要落在主线程所在的 NUMA 节点（第五轮：远端写很贵），所以分配器新增 `melspec_reserve_allocation_on_node(bytes, node)`，触页前 `mbind(MPOL_PREFERRED)` 到主线程启动时所在的节点（`getcpu`）。
+8. 预留块的取用条件从"不超过容量且不小于一半"改为**字节数精确相等**：预留现在可能在 `main.cpp` 还在读文件时完成，而 `y`（每样本 8 字节，197 MB）和 float 副本（197 MB）几乎一样大，按原条件 `y` 会把预留块拿走。
+
+**`main.cpp` 的行为不变**：它照常读文件、调用 `compute_melspectrogram`、写文件；预取只是让这次调用不需要等待。
+
+**迭代过程（trace：`MELSPEC_TRACE=1` 时打印各时间点，单位 s，从静态构造开始计时）。**
+
+| 版本 | 作业 | 现象 | validate（default / small / large / narrow） |
+|---|---|---|---|
+| v1：读完再算，单线程 `memcmp` 校验 | 535 | 主线程 0.083 到达，后台 0.09 就算完了，但单线程 `memcmp` 两份 197 MB 用了约 38 ms | 0.265–0.271 / 0.152–0.158 / 0.276–0.285 / 0.263–0.275 |
+| v2：32 线程校验 + 边读边算 | 536 | 校验约 5 ms；default 后台 0.063 完成，早于主线程 | 0.221–0.241 / 0.130–0.132 / 0.251–0.262 / 0.250–0.259 |
+
+同一作业中 master 为 0.287–0.298 / 0.181–0.186 / 0.361–0.366 / 0.348–0.355 s。
+
+### 改动 3：并行 memset（`MELSPEC_PAR_MEMSET`，默认开启）
+
+`main.cpp` 里 `std::vector<int16_t> buf(n)`、`y.resize(n)`、`std::vector<float> out_f32(n)` 的值初始化被编译成 `memset` 调用（`objdump` 确认 `main.o` 中有 4 处），都是单线程、在关键路径上。`large_alloc.cpp`（`HUGE_ALLOC` 构建）提供了自己的 `memset` 符号：≥32 MiB 时按 4 KiB 边界分给 16 个线程，各自调用 C 库的 `memset`（启动时用 `dlsym(RTLD_NEXT, "memset")` 取得）；其余情况直接转给 C 库。语义与 C 库完全相同，与已有的全局 `operator new` 替换是同一类做法。`allocator_init` 用 `constructor(101)` 在所有 C++ 静态构造之前运行；在它之前（其他库的启动代码）调用的 `memset` 逐字节写（经 volatile，防止编译器把这个循环又变回 `memset`）。
+
+### 测量方法：交替运行
+
+`validate --runs 5` 的轮间波动有 ±20 ms，分辨不出 10 ms 级的差别。之后的开关 A/B 都用 `jobs/ab.py`：计时方式与 validate 相同（`perf_counter` 包住 `subprocess.run`，输出写到 `/tmp` 的 mkstemp 文件），各变体**随机顺序交替**运行，每个用例每个变体 20 次，比较最小值、p25 和中位数。
+
+### 开关 A/B（交替运行，各 20 次，中位数，s）
+
+**job 539（hepnode1）**：
+
+| 变体 | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| master | 0.315 | 0.190 | 0.386 | 0.372 |
+| 预取（base） | 0.277 | 0.143 | 0.286 | 0.277 |
+| + nice 10 | 0.267 | 0.141 | 0.284 | 0.269 |
+| + 大块内存都放主线程的 NUMA 节点 | 0.271 | 0.153 | 0.294 | 0.293 |
+| + 并行 memset | **0.260** | **0.134** | **0.280** | **0.270** |
+| 三者都开 | 0.272 | 0.140 | 0.291 | 0.280 |
+
+**job 545（hepnode1，并行 memset 已默认开启）**：关闭并行 memset 为 0.263 / 0.146 / 0.284 / 0.286；nice 5 / 10 / 19 为 0.258 / 0.252 / 0.257（default），10 在四组上都不差于其他取值。于是**并行 memset 默认开启、nice 默认 10；NUMA 本地化不采用**（中位数和方差都更差）。
+
+### 剩余时间去了哪里：后台计算拖慢了主线程的读
+
+加了两个诊断：`Prefetch` 析构时（`main` 返回之后）打印时间戳；`MELSPEC_PREFETCH=2` 只记录 `main.cpp` 何时调用 compute，不做预取。
+
+- 从 compute 返回（约 0.09–0.11）到 `main` 返回（0.24–0.26），即 `write_output`（float 转换约 45 ms + 写 tmpfs 约 75 ms）加 vector 析构，约 **0.15 s**；之后的进程退出只有 5–10 ms。
+- `/cache` 是 BeeGFS（网络文件系统），`/tmp` 是 tmpfs 且 `shmem_enabled=never`，这两段由 `main.cpp` 的读写方式决定，无法改动。
+- **主线程进入 compute 的时间（job 547、549，hepnode3）**：
+
+| | 8192 | 16384 |
+|---|---:|---:|
+| 不预取（`MELSPEC_PREFETCH=2`） | 0.055–0.060 | 0.057–0.059 |
+| 后台只读样本、不计算（临时诊断开关） | 0.057–0.060 | 0.056–0.057 |
+| 完整预取 | 0.068–0.083 | 0.074–0.103 |
+
+读线程完全没有干扰，拖慢主线程 10–40 ms 的是后台计算阶段。为此试了（交替运行，各 20 次，job 547、548、550），全部不比默认好：
+
+| 尝试 | 结果（中位数，相对默认） |
+|---|---|
+| 读线程 2 / 4 / 8 / 16 | 4–16 相同；2 个慢 10–20 ms |
+| 后台线程避开主线程所在的 1 / 4 / 16 / 32 个 CPU | default、small 持平；16384 两组慢 3–30 ms（计算线程少了） |
+| 后台线程用 `SCHED_IDLE` | 慢 10–20 ms；主线程反而到达得更晚，推测后台线程持有内存映射相关的锁时被抢占，主线程要等它 |
+| 后台 MKL 限制为 AVX2（检验 AVX-512 降频的假设） | default 持平，16384 两组慢 10 ms |
+
+所以干扰既不是 CPU 争抢，也不是 AVX-512 降频，更可能来自后台的大块分配与缺页和主线程的内存访问竞争。这些开关都已从源码中删除。
+
+另外考虑过但没有做的：GCC 的 `-ftree-parallelize-loops` 给 `main.cpp` 的两个转换循环做自动并行化，编译器无法证明输入输出不重叠（`dependence analysis failed`），没有生效；剪枝 FFT（只算 Mel 用到的 bin）按输出剪枝只能省最后一级，不到 4%；利用 hop=128 的帧重叠做滑动 DFT 能省约 45% 的运算，但 float 下递推误差会在 19 万帧上累积，风险太大。
+
+### 最终验收（job 551，hepnode3，独占 64 核）
+
+- 官方流程 `make clean; make test`：4/4 PASS，0.239 / 0.123 / 0.263 / 0.248 s。
+- 单元测试（float、double、`MKL=0` 三种构建）和 `allocator-test` 全部 PASS。
+- 不存在的输入、`--help`、未知参数、非法 n_fft、非数字参数、缺参数值：退出码和 stderr 与 master 完全相同。
+- double 构建（`-DMELSPEC_FFT_FLOAT=0`）的四个用例输出与 master **逐字节相同**；默认构建开/关预取和并行 memset、`MKL=0` 构建开/关预取，输出也都逐字节相同。
+- validate 三轮：
+
+| | default | small_mels | large_fft | narrow_band |
+|---|---:|---:|---:|---:|
+| 第八轮最终版 | 0.223–0.242 | 0.115–0.120 | 0.254–0.269 | 0.244–0.251 |
+| master（同一作业） | 0.286–0.297 | 0.178–0.182 | 0.346–0.353 | 0.338–0.344 |
+| `MKL=0` 回退路径 | 0.261 | 0.142 | 0.330 | 0.325 |
+
+- 交替运行（各 20 次）：master 中位数 0.302 / 0.189 / 0.367 / 0.358 s，最终版 0.246 / 0.133 / 0.260 / 0.253 s。
+
+### 加速比（以 melspec.py 为基准）
+
+两边都用 validate.py 的口径，即多次运行取最小值。melspec.py 用 job 533，优化版用 job 551 四次 validate 中各用例的最小值（default 0.223、small_mels 0.115、large_fft 0.254、narrow_band 0.244 s）：
+
+| case | melspec.py | master | 第八轮 | master 相对 melspec.py | **第八轮相对 melspec.py** | 第八轮相对 master |
+|---|---:|---:|---:|---:|---:|---:|
+| default | 17.305 s | 0.286 s | 0.223 s | 60.5× | **77.6×** | 1.28× |
+| small_mels | 17.163 s | 0.178 s | 0.115 s | 96.4× | **149.2×** | 1.55× |
+| large_fft | 32.422 s | 0.346 s | 0.254 s | 93.7× | **127.6×** | 1.36× |
+| narrow_band | 32.676 s | 0.338 s | 0.244 s | 96.7× | **133.9×** | 1.39× |
+
+（master 一列取 job 551 中 master 三轮的最小值。）
+
+附：如果 melspec.py 改取 job 546 中最慢的一次（17.729 / 23.095 / 35.776 / 33.564 s），再除以上面的最快值，分别是 79.5 / 200.8 / 140.9 / 137.6 倍。这个口径两边取法不对称，不是 validate.py 的口径；small_mels 的 23.095 s 是一次偶发抖动，单这一次就让倍数多出约 35%。正文的加速比以上表为准。
+
+## 第九轮：提前截断输出文件、为 main.cpp 预留 buf / y（2026-10-31）
+
+目标是让 default 相对 melspec.py 过 100 倍（两边都取最小值时需要 ≤0.173 s）。
+
+**strace 拆分（job 552，hepnode3）。** 主线程的系统调用打时间戳后发现两处之前没看到的串行开销：① `open(输出, O_TRUNC)` 要 18–22 ms，因为 validate.py 的 5 次运行复用同一个临时文件，截断时内核要释放上一次写下的 197 MB tmpfs 页；② 打开输入到开始 `read` 之间 14.5 ms，是 `buf`（49 MB）的分配和触页，被后台同时进行的大块分配拖慢（单独做只要 3–4 ms）。
+
+**改动（源码即 job 553 的 `round8/src9`）。**
+
+1. 提前截断：后台读完输入、确认参数合法（`validate_mel_parameters`、`hop > 0`、样本数不少于 `n_fft`，在静态构造里检查）之后，对已存在的普通文件 `ftruncate(fd, 0)`；用 `O_WRONLY | O_NONBLOCK` 打开，不创建文件，`fstat` 不是普通文件就跳过，所以不会碰 FIFO 或设备。这一步由读线程完成，读线程被 leader 线程 join，leader 又在 `compute_melspectrogram` 返回前被 join，所以一定早于 `main.cpp` 打开文件。环境变量 `MELSPEC_PREFETCH_TRUNCATE=0` 关闭。
+2. 预留槽从 1 个扩成 4 个，仍按字节数精确匹配。静态构造里同步为 `main.cpp` 的 `buf`（n×2 字节）预留并触页；后台线程在分配完自己的样本数组之后再为 `y`（n×8 字节）预留（顺序不能反，两者字节数相同）。都放在主线程启动时所在的 NUMA 节点。
+
+**结果（job 553，hepnode3）。** `open(O_TRUNC)` 降到 0.03 ms；打开输入到 `read` 降到 5 ms。四个用例的输出与上一版逐字节相同，单元测试和分配器测试通过。交替运行各 20 次的中位数：上一版 0.242 / 0.123 / 0.274 / 0.262 s，新版 **0.227 / 0.120 / 0.267 / 0.256 s**，关掉截断后与上一版持平（0.242 / 0.130 / 0.286 / 0.272），说明收益主要来自截断。validate 两轮：0.221 / 0.110 / 0.254 / 0.249 s 和 **0.218 / 0.107 / 0.262 / 0.240 s**。
+
+**没有采用的。**
+
+- 后台输出放主线程 NUMA 节点（job 554，`MELSPEC_PREFETCH_LOCAL_OUTPUT=1`）：中位数 0.255 / 0.119 / 0.289 / 0.275，比默认（0.221 / 0.117 / 0.267 / 0.257）慢，删除。
+- 后台样本改存 int16（job 555）：交替运行中位数快约 5 ms（0.228 / 0.125 / 0.257 / 0.245 对 0.233 / 0.125 / 0.263 / 0.250），但正确性对比因为 `/tmp/a.bin` 被其他用户占用而失效，`MKL=0` 构建还有编译错误（`sample_value` 只定义在 MKL 分支里）。用户要求不再提交作业，所以代码退回 job 553 验证过的 src9。
+
+**melspec.py 在 hepnode3 上（job 554）。** validate（3 次取最小）17.318 / 16.995 / 36.846 / 32.363 s；逐次时间 default 25.474 / 17.231 / 27.450，small_mels 17.153 / 16.970 / 16.977，large_fft 32.800 / 32.928 / 42.784，narrow_band 32.813 / 32.757 / 32.671 s。default 和 large_fft 有明显的偶发慢跑。
+
+**为什么到不了 100 倍（两边取最小）。** strace 下最终版 default 的构成：启动约 10 ms，`read` 30–36 ms，`buf`/`y` 清零和 int16→double 约 40 ms，等后台和校验约 8 ms，double→float 约 55 ms，写 tmpfs 加退出约 77 ms。即使后台完全不干扰，`main.cpp` 自己的读、转换、写也约 0.175 s。
+
+### 最终加速比
+
+优化版取 validate.py 最好的一次（default 0.218 s、small_mels 0.107 s 来自 job 553；large_fft 0.254 s 来自 job 551/553；narrow_band 0.240 s 来自 job 553）。
+
+| case | melspec.py 最小（job 533） | melspec.py 最慢（job 546/554 逐次） | 优化版最快 | 最小/最快 | 最慢/最快 |
+|---|---:|---:|---:|---:|---:|
+| default | 17.305 s | 27.450 s | 0.218 s | 79.4× | 125.9× |
+| small_mels | 17.163 s | 23.095 s | 0.107 s | 160.4× | 215.8× |
+| large_fft | 32.422 s | 42.784 s | 0.254 s | 127.6× | 168.4× |
+| narrow_band | 32.676 s | 33.564 s | 0.240 s | 136.2× | 139.8× |
+
+用户要求 PPT 里按"最慢/最快"口径展示（`melspec优化.pptx` 第 5 页），页面上注明了口径，并在旁边附上"最小/最快"的数字。
