@@ -1191,3 +1191,19 @@ store 在 default 上约占 compute 的 9%。每次写缺失都要先把缓存�
 ### 结论
 
 在集群上 GPU 在所有配置下都更慢，不采用。原因与 MPI 那节相同：每次运行都是新进程，固定的启动开销比要省的计算还大。集群 CPU 路径的 compute 只有约 0.08 s，而即使用上常驻进程这种接近"持久模式"的做法，context 也要 0.10 s 才就绪，再加 cuFFT 建 plan 的约 0.02 s；另外，同一构建禁用 GPU 时也比 master 慢约 0.08 s（0.363 vs 0.28 s），推测主要是启动时加载 libcufft/libcudart 这些很大的动态库，但没有单独验证。GPU 只有在 CPU 弱、计算量大的机器上（如 prometheus 的 16384 点）才划算。常驻进程的做法即使能更快也不打算用：它相当于在评测前替管理员开启持久模式，超出了优化程序本身的范围。
+
+## 补充实验：MPI 第二轮——逐节点测量、MPICH 与预先启动的服务进程（job 424）——不采用
+
+用户提出不同节点上 MPI 的效果可能不同。第一轮（job 279）只在 hepnode2/3 上测了 Open MPI 和 Intel MPI；这次 hepnode1 也空闲，于是在 hepnode1/2/3 三台节点上同时测三种 MPI（spack 中的 MPICH 5.0.1、Open MPI 5.0.10、Intel MPI 2021.18）单进程启动 `MPI_Init` 的耗时，并尝试 MPICH 的 `MPI_Open_port`/`MPI_Comm_connect`：在另一台节点上预先启动一个服务进程，每次运行的新进程只需连接它，从而绕开每次拉起远端进程的开销。探针程序为 `~/workspace/melspec-optimization-20261029/mpi/probe2.cpp`。
+
+| 单进程 `MPI_Init`（3 次，s） | hepnode1 | hepnode2 | hepnode3 |
+|---|---|---|---|
+| MPICH 5.0.1（ch4:ofi） | 0.132–0.146 | 0.139–0.149 | 0.135–0.142 |
+| Open MPI 5.0.10 | 0.075–0.082 | 0.080–0.081 | 0.076–0.079 |
+| Intel MPI 2021.18 | 0.273–0.281 | 0.275–0.276 | 0.277–0.278 |
+
+- **三台节点几乎没有差别**（同型号的 2× Xeon Gold 6338，同一套软件）：最快的 Open MPI 也要约 0.08 s，MPICH 约 0.14 s（空程序的进程墙钟 0.17–0.19 s），Intel MPI 约 0.28 s。
+- **spack 的 libfabric 没有 verbs 等 InfiniBand provider**（`fi_info -l` 只有 udp、tcp、sockets 和若干 hook），MPICH 构建时也加了 `--without-ibverbs`，所以 MPICH 节点间只能走 TCP，用不上 FDR IB。`FI_PROVIDER=verbs` 直接初始化失败。
+- 预先启动的服务进程在默认和 `FI_PROVIDER=tcp` 两种设置下都没能在 10 s 内写出端口文件（srun 作业步被取消），没有继续调试，因为下面的结论不依赖它。
+
+**结论（与第一轮相同，这次覆盖了所有可用节点和三种 MPI）**：每次运行都是新进程，至少要付一次 `MPI_Init`，最快约 0.08 s，与单节点 64 线程的整个 compute（约 0.08 s）相当；而把 compute 分给第二台节点最多只能省约 0.04 s，还要加上经 TCP 传回约 99 MB 结果的时间。即使像 CUDA 那样把 `MPI_Init` 放进 `main` 之前启动的线程、与读文件（约 0.07 s）重叠，Open MPI 5 的单进程模式也不能在没有 PRRTE 的情况下 connect/accept，只能用 MPICH（0.14 s，只有 TCP），仍然划不来。MPI 方向到此为止，源码未改动。
