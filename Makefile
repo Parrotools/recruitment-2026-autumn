@@ -22,12 +22,18 @@ ARCH_FLAGS ?= -march=native
 # spack installation and falls back to the built-in FFT when it is missing.
 MKLROOT ?= /data/spack/opt/spack/linux-ubuntu24.04-icelake/gcc-15.2.0/intel-oneapi-mkl-2026.0.0-hfx23rl27uqjzo3hhabps7y6tbsaujgf/mkl/2026.0
 MKL ?= $(if $(wildcard $(MKLROOT)/include/mkl_dfti.h),1,0)
+# CUDA (cuFFT) path for the whole computation, used at run time when a GPU
+# is present (otherwise the CPU paths below run). Enabled when nvcc exists.
+CUDA_HOME ?= /usr/local/cuda
+NVCC ?= $(CUDA_HOME)/bin/nvcc
+CUDA ?= $(if $(wildcard $(NVCC)),1,0)
+CUDA_ARCH ?= native
 CLANG_FORMAT ?= clang-format
 MELSPEC_TEST_TMPDIR ?= $(abspath $(CURDIR)/../melspec-optimization-artifacts)
 ROUND2_BUILD_DIR ?= $(abspath $(CURDIR)/../melspec-optimization-20261029/round2/build)
 
-ifneq ($(filter-out 0 1,$(SCALAR) $(HUGE_ALLOC) $(FUSED_FFT) $(AVX512) $(MKL)),)
-$(error SCALAR, HUGE_ALLOC, FUSED_FFT, and AVX512 must be 0 or 1)
+ifneq ($(filter-out 0 1,$(SCALAR) $(HUGE_ALLOC) $(FUSED_FFT) $(AVX512) $(MKL) $(CUDA)),)
+$(error SCALAR, HUGE_ALLOC, FUSED_FFT, AVX512, MKL, and CUDA must be 0 or 1)
 endif
 
 MELSPEC_DEFINES =
@@ -77,6 +83,11 @@ LDLIBS += -Wl,--start-group $(MKLROOT)/lib/libmkl_intel_lp64.a \
 	-Wl,--end-group -lm -ldl
 endif
 
+MELSPEC_DEFINES += -DMELSPEC_CUDA=$(CUDA)
+ifeq ($(CUDA),1)
+LDLIBS += -L$(CUDA_HOME)/lib64 -Wl,-rpath,$(CUDA_HOME)/lib64 -lcufft -lcudart
+endif
+
 ifeq ($(AVX512),1)
 ifeq ($(SCALAR),0)
 ifeq ($(findstring -mavx512f,$(CXXFLAGS) $(ARCH_FLAGS)),)
@@ -94,6 +105,9 @@ endif
 SRCS = $(wildcard src/*.cpp)
 INCS = $(wildcard include/*.h)
 OBJS = $(SRCS:.cpp=.o)
+ifeq ($(CUDA),1)
+OBJS += src/melspec_cuda.o
+endif
 EXEC = melspec
 
 .PHONY: all clean test unit-test allocator-test format benchmark-compute
@@ -106,8 +120,12 @@ $(EXEC): $(OBJS)
 %.o: %.cpp $(INCS)
 	$(CXX) $(CPPFLAGS) $(MELSPEC_DEFINES) $(MELSPEC_COMPILE_FLAGS) -I./include -o $@ -c $<
 
+src/melspec_cuda.o: src/melspec_cuda.cu $(INCS)
+	$(NVCC) -O3 -std=c++17 -arch=$(CUDA_ARCH) -Xcompiler "$(CXXFLAGS) $(ARCH_FLAGS) -pthread" \
+		-I./include -o $@ -c $<
+
 clean:
-	rm -f $(OBJS) $(EXEC)
+	rm -f $(OBJS) src/melspec_cuda.o $(EXEC)
 
 test: $(EXEC)
 	python3 ./validate.py ./$(EXEC)

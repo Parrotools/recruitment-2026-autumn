@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <exception>
 #include <limits>
+#include <memory>
 #include <stdexcept>
 #include <thread>
 #include <type_traits>
@@ -37,6 +38,14 @@
 
 #if MELSPEC_MKL
 #include <mkl_dfti.h>
+#endif
+
+#ifndef MELSPEC_CUDA
+#define MELSPEC_CUDA 0
+#endif
+
+#if MELSPEC_CUDA
+#include "melspec_cuda.h"
 #endif
 
 #if defined(__linux__) && defined(MELSPEC_HUGE_ALLOC) && MELSPEC_HUGE_ALLOC
@@ -388,6 +397,198 @@ void run_workers(std::size_t workers, Body&& body) {
         if (error) std::rethrow_exception(error);
     }
 }
+
+#if MELSPEC_CUDA
+// Waits until ready() holds or stop is set; returns ready(). Sleeps after a
+// short spin so idle host threads leave the cores to those doing work.
+template <typename Ready>
+bool wait_for(Ready&& ready, const std::atomic<bool>& stop) {
+    for (int spins = 0;; ++spins) {
+        if (ready()) return true;
+        if (stop.load(std::memory_order_acquire)) return ready();
+        if (spins < 64)
+            std::this_thread::yield();
+        else
+            std::this_thread::sleep_for(std::chrono::microseconds(20));
+    }
+}
+
+// GPU path: the device computes float Mel rows chunk by chunk (see
+// melspec_cuda.cu) while host threads widen each chunk into the double
+// output. While the CUDA start-up thread is still creating the context, the
+// host threads convert the samples to float (exact: they are pcm / 32768),
+// one of them sizes (zero-fills) the output, and the calling thread faults
+// in write_output's float copy, as in compute_with_mkl. Returns false, with
+// the output possibly already sized, when no GPU is usable.
+template <typename PrepareOutput>
+bool compute_with_cuda(const double* samples, std::size_t n_samples,
+                       std::size_t n_frames, std::size_t fft_size,
+                       std::size_t hop, const MelWeights& mel,
+                       std::size_t requested_threads,
+                       PrepareOutput&& prepare_output, bool trace) {
+    using Clock = std::chrono::steady_clock;
+    const Clock::time_point start = Clock::now();
+    const auto seconds = [&] {
+        return std::chrono::duration<double>(Clock::now() - start).count();
+    };
+    const std::size_t mel_count = mel.bands.size();
+    std::vector<std::size_t> first(mel_count), end(mel_count),
+        offset(mel_count);
+    for (std::size_t m = 0; m < mel_count; ++m) {
+        first[m] = mel.bands[m].first;
+        end[m] = mel.bands[m].end;
+        offset[m] = mel.bands[m].offset;
+    }
+    // Every element is written by the conversion below.
+    std::unique_ptr<float[]> converted(new float[n_samples]);
+    const melspec_cuda::Job job{converted.get(), n_samples,    n_frames,
+                                fft_size,        hop,          mel_count,
+                                first.data(),    end.data(),   offset.data(),
+                                mel.values.data(), mel.values.size()};
+
+    constexpr std::size_t kConvertPiece = std::size_t(1) << 20;
+    const std::size_t pieces = (n_samples + kConvertPiece - 1) / kConvertPiece;
+    std::atomic<std::size_t> next_piece{0};
+    std::atomic<std::size_t> pieces_done{0};
+    const auto convert = [&] {
+        for (;;) {
+            const std::size_t piece =
+                next_piece.fetch_add(1, std::memory_order_relaxed);
+            if (piece >= pieces) return;
+            const std::size_t lo = piece * kConvertPiece;
+            const std::size_t hi = std::min(n_samples, lo + kConvertPiece);
+            for (std::size_t i = lo; i < hi; ++i)
+                converted[i] = static_cast<float>(samples[i]);
+            pieces_done.fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    enum : int { kPending, kReady, kFailed };
+    std::atomic<int> output_state{kPending};
+    double* output = nullptr;  // published by output_state (release/acquire)
+    // Chunk c is handed out through slot c % kSlots (the GPU side cycles its
+    // pinned staging buffers the same way); rows of all chunks are claimed
+    // as consecutive tickets.
+    constexpr std::size_t kSlots = melspec_cuda::kSlots;
+    struct Chunk {
+        std::size_t frame0;
+        std::size_t count;
+        const float* rows;
+    };
+    Chunk chunks[kSlots] = {};
+    std::atomic<std::size_t> published{0};
+    std::atomic<std::size_t> next_ticket{0};
+    std::atomic<std::size_t> rows_done[kSlots] = {};
+    std::atomic<bool> stop{false};
+
+    const auto helper = [&](std::size_t index) {
+        if (index == 0) {
+            try {
+                output = prepare_output();
+            } catch (...) {
+                output_state.store(kFailed, std::memory_order_release);
+                throw;
+            }
+            output_state.store(kReady, std::memory_order_release);
+        }
+        convert();
+        if (!wait_for(
+                [&] {
+                    return output_state.load(std::memory_order_acquire) !=
+                           kPending;
+                },
+                stop) ||
+            output_state.load(std::memory_order_acquire) != kReady)
+            return;
+        for (;;) {
+            const std::size_t ticket =
+                next_ticket.fetch_add(1, std::memory_order_relaxed);
+            const std::size_t c = ticket / mel_count;
+            if (!wait_for(
+                    [&] {
+                        return published.load(std::memory_order_acquire) > c;
+                    },
+                    stop))
+                return;
+            const Chunk& chunk = chunks[c % kSlots];
+            const std::size_t m = ticket % mel_count;
+            const float* source = chunk.rows + m * chunk.count;
+            double* destination = output + m * n_frames + chunk.frame0;
+            for (std::size_t f = 0; f < chunk.count; ++f)
+                destination[f] = source[f];
+            rows_done[c % kSlots].fetch_add(1, std::memory_order_release);
+        }
+    };
+
+    const std::size_t helpers = std::max<std::size_t>(
+        1, std::min(requested_threads, usable_cpus()) - 1);
+    std::vector<std::thread> threads;
+    std::vector<std::exception_ptr> errors(helpers);
+    std::exception_ptr main_error;
+    bool gpu = false;
+    try {
+        threads.reserve(helpers);
+        for (std::size_t i = 0; i < helpers; ++i)
+            threads.emplace_back([&, i] {
+                try {
+                    helper(i);
+                } catch (...) {
+                    errors[i] = std::current_exception();
+                }
+            });
+#if MELSPEC_HAS_RESERVE
+        if (melspec_reserve_allocation != nullptr)
+            melspec_reserve_allocation(mel_count * n_frames * sizeof(float));
+#endif
+        convert();
+        const double converted_at = seconds();
+        gpu = melspec_cuda::available();
+        const double ready_at = seconds();
+        if (gpu) {
+            wait_for(
+                [&] {
+                    return pieces_done.load(std::memory_order_acquire) ==
+                           pieces;
+                },
+                stop);
+            if (trace)
+                std::fprintf(stderr,
+                             "trace cuda host: converted %.4f gpu ready "
+                             "%.4f samples ready %.4f s\n",
+                             converted_at, ready_at, seconds());
+            std::size_t consumed = 0;
+            melspec_cuda::compute(
+                job,
+                [&](std::size_t frame0, std::size_t count,
+                    const float* rows) {
+                    const std::size_t slot = consumed % kSlots;
+                    chunks[slot] = Chunk{frame0, count, rows};
+                    rows_done[slot].store(0, std::memory_order_relaxed);
+                    published.store(++consumed, std::memory_order_release);
+                    while (rows_done[slot].load(std::memory_order_acquire) <
+                           mel_count) {
+                        if (output_state.load(std::memory_order_acquire) ==
+                            kFailed)
+                            throw std::runtime_error(
+                                "output preparation failed");
+                        std::this_thread::yield();
+                    }
+                },
+                trace);
+        }
+    } catch (...) {
+        main_error = std::current_exception();
+    }
+    stop.store(true, std::memory_order_release);
+    for (std::thread& thread : threads) thread.join();
+    if (!gpu && !main_error) return false;
+    // A failed output preparation is the root cause of a consume failure.
+    for (const std::exception_ptr& error : errors)
+        if (error) std::rethrow_exception(error);
+    if (main_error) std::rethrow_exception(main_error);
+    return true;
+}
+#endif
 
 #if MELSPEC_MKL
 #ifndef MELSPEC_MKL_BATCH
@@ -896,6 +1097,25 @@ void compute_melspectrogram(const std::vector<double>& y, int sr, int n_fft,
                                           static_cast<double>(fft_size)));
     }
     trace.mark("setup");
+
+#if MELSPEC_CUDA
+    // The start-up thread must finish before main returns: exiting while it
+    // is inside the CUDA runtime races with the runtime's own teardown.
+    // compute_with_cuda waits for it; so does the n_fft == 1 path here.
+    if (n_fft <= 1) melspec_cuda::available();
+    if (n_fft > 1 &&
+        compute_with_cuda(
+            input_samples, input->size(), n_frames, fft_size, hop, mel,
+            requested_threads,
+            [&] {
+                output.resize(output_count);
+                return output.data();
+            },
+            trace.enabled())) {
+        trace.mark("kernel");
+        return;
+    }
+#endif
 
 #if MELSPEC_MKL
     if (n_fft > 1) {
